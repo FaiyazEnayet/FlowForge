@@ -1,0 +1,91 @@
+"""Freeze a small demo bundle for the Streamlit dashboard.
+
+Reads runs/eval_arrays.npz and runs/metrics.json (written by examples/demo.py,
+seed 7) and writes demo/demo.npz + demo/metrics.json: a small precomputed
+sample that ships with the repo so `streamlit run app.py` works from a fresh
+clone with no data/ or runs/ (both gitignored). Deterministic: seed 7.
+
+Nothing here invents data. The generated windows are outputs of the DDPM
+trained in examples/demo.py; the metrics are copied verbatim from
+runs/metrics.json.
+"""
+
+import json
+import os
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+RUNS = os.path.join(HERE, "..", "runs")
+DEMO = os.path.join(HERE, "..", "demo")
+
+SEED = 7
+N_WINDOWS = 64  # real + 64 generated windows in the bundle
+
+FEATURES = ["log_ret", "log_spread_bps", "log_bid_sz", "log_ask_sz",
+            "imbalance", "signed_flow", "log_trade_count"]
+assert len(FEATURES) == 7
+
+
+def main():
+    rng = np.random.default_rng(SEED)
+    z = np.load(os.path.join(RUNS, "eval_arrays.npz"))
+    real = z["real_test"]
+    gen = z["gen_test_ddpm"]
+    assert real.shape[1:] == (60, 7) and gen.shape[1:] == (60, 7)
+
+    i_real = rng.choice(len(real), N_WINDOWS, replace=False)
+    i_gen = rng.choice(len(gen), N_WINDOWS, replace=False)
+    real_s = np.asarray(real[i_real], dtype=np.float32)
+    gen_s = np.asarray(gen[i_gen], dtype=np.float32)
+    assert np.isfinite(real_s).all() and np.isfinite(gen_s).all()
+
+    with open(os.path.join(RUNS, "metrics.json")) as f:
+        metrics = json.load(f)
+    ddpm = metrics["ddpm"]
+    vae = metrics["vae"]
+
+    os.makedirs(DEMO, exist_ok=True)
+    np.savez_compressed(
+        os.path.join(DEMO, "demo.npz"),
+        real_windows=real_s,
+        gen_windows=gen_s,
+        feature_names=np.array(FEATURES),
+        feature_mean=z["feature_mean"],
+        feature_std=z["feature_std"],
+        disc_scores_real=np.asarray(z["disc_scores_real"], dtype=np.float32),
+        disc_scores_gen=np.asarray(z["disc_scores_gen"], dtype=np.float32),
+        disc_auc=np.float32(ddpm["discriminator"]["auc_test"]),
+        real_idx=np.asarray(i_real),
+        gen_idx=np.asarray(i_gen),
+    )
+
+    summary = {
+        "seed": metrics["seed"],
+        "n_train": metrics["n_train"],
+        "n_val": metrics["n_val"],
+        "n_test": metrics["n_test"],
+        "seconds": metrics["seconds"],
+        "chunks": metrics["chunks"],
+        "ddpm_params": metrics["ddpm_config"]["params"],
+        "ddpm_epochs": metrics["ddpm_config"]["epochs"],
+        "models": {
+            name: {
+                "mean_w1": rep["marginals"]["mean_w1"],
+                "auc_test": rep["discriminator"]["auc_test"],
+                "auc_val": rep["discriminator"]["auc_val"],
+            }
+            for name, rep in (("ddpm", ddpm), ("vae", vae))
+        },
+        "marginals": ddpm["marginals"]["rows"],
+        "flow_acf": ddpm["flow_acf"]["rows"],
+    }
+    with open(os.path.join(DEMO, "metrics.json"), "w") as f:
+        json.dump(summary, f, indent=1)
+    print(f"bundle -> demo/demo.npz ({N_WINDOWS} real + {N_WINDOWS} generated "
+          f"windows, seed {SEED})")
+    print("metrics -> demo/metrics.json")
+
+
+if __name__ == "__main__":
+    main()
