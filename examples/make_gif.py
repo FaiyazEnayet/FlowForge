@@ -43,12 +43,14 @@ def main():
     t = np.arange(60)
 
     fig, axes = plt.subplots(1, 2, figsize=(6.4, 3.6), sharey=False)
+    fig.subplots_adjust(top=0.88, wspace=0.25)
     lines = []
     for ax, title, color in zip(axes, ["REAL test window", "DDPM dream"],
                                 ["steelblue", "darkorange"]):
         (ln,) = ax.plot([], [], lw=2, color=color)
         ax.set_xlim(0, 59)
         ax.set_xlabel("seconds")
+        ax.ticklabel_format(style="plain", useOffset=False)
         ax.grid(alpha=0.3)
         lines.append((ax, ln, title))
 
@@ -72,8 +74,6 @@ def main():
             pad = max((hi - lo) * 0.15, 0.05)
             ax.set_ylim(lo - pad, hi + pad)
             artists.append(ln)
-        fig.suptitle("FlowForge: real market windows vs DDPM dreams",
-                     fontsize=12, y=0.98)
         return artists
 
     anim = FuncAnimation(fig, frame, frames=N_PAIRS * FRAMES_PER_PAIR,
