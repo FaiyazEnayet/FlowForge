@@ -35,8 +35,6 @@ The diffusion model beats the VAE clearly. Mean Wasserstein distance across feat
 
 Two gaps closed since the first version. The discriminator AUC fell from 0.734 to 0.669: the classifier still separates dreams from reality, but noticeably worse than before. The imbalance mean shift shrank from 0.52 to 0.17 in standardized units. What worked: longer training, EMA sampling weights, a larger denoiser, and two extra hours of recordings from a different time of day. What did not move the needle much on its own: model size without EMA.
 
-Honest gaps that remain. The discriminator still wins at 0.669, so the dreams are good but not perfect. The spread feature is nearly a point mass in this data (BTC spread pinned at one tick), which mostly tests whether the generator reproduces that. Book sizes remain the hardest feature: the generator underplays their variance. And one data truth: eight sessions across two evenings is still one asset in one mood. Different regimes would give different numbers.
-
 ## Quickstart
 
 ```bash
@@ -63,6 +61,10 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/ -q
 
 ## Honest limitations
 
+- The discriminator still wins at 0.669. The dreams are good, not perfect.
+- Book sizes are the hardest feature: the generator underplays their variance.
+- Spread is nearly a point mass in this data (BTC spread pinned at one tick), which mostly tests whether the generator reproduces that.
+- Eight sessions across two evenings is one asset in one mood. Different regimes would give different numbers.
 - Small models on CPU, four hours of one asset across two evenings. This is a proof of concept, not a production simulator.
 - BTCUSDT spot only. Crypto microstructure is not equities: no open or close, different fee structure, 24/7 retail flow.
 - The recorder saves only the touch, not full depth, so the model learns top of book dynamics only.
