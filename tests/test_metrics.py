@@ -80,3 +80,20 @@ def test_discriminator_detects_obvious_shift():
     out = discriminator_auc(real_val, gen_val, real_test, gen_test,
                             seed=0, epochs=10)
     assert out["auc_test"] > 0.95, out
+
+
+def test_discriminator_returns_test_scores():
+    # The figure script needs per-window test scores, real first.
+    rng = np.random.default_rng(7)
+    n_r, n_g = 25, 30
+    real_val = rng.normal(size=(40, 60, 7))
+    gen_val = rng.normal(size=(40, 60, 7))
+    real_test = rng.normal(size=(n_r, 60, 7))
+    gen_test = rng.normal(size=(n_g, 60, 7))
+    out = discriminator_auc(real_val, gen_val, real_test, gen_test,
+                            seed=0, epochs=5)
+    scores = np.asarray(out["test_scores"], dtype=np.float64)
+    assert scores.shape == (n_r + n_g,)
+    assert int(out["test_n_real"]) == n_r
+    assert np.isfinite(scores).all()
+    assert (scores >= 0).all() and (scores <= 1).all()

@@ -79,3 +79,36 @@ def test_save_load_roundtrip(tmp_path):
     assert np.array_equal(ds.train.x, ds2.train.x)
     assert np.array_equal(ds.test.regime, ds2.test.regime)
     assert ds2.n_chunks == ds.n_chunks
+
+
+def test_large_gap_between_chunks_keeps_splits_populated(tmp_path):    # Regression test: chunks recorded hours apart must not leave a split
+    # empty. The split runs on the concatenated recording timeline, so the
+    # later session lands in test (different time of day by design).
+    t0 = 1_700_000_000_000
+    d1 = _synth_chunk(tmp_path, "c1", n_sec=1200, t0_ms=t0, seed=0)
+    d2 = _synth_chunk(tmp_path, "c2", n_sec=1200, t0_ms=t0 + 1_300_000, seed=1)
+    # four hours later, like a second recording session
+    d3 = _synth_chunk(tmp_path, "c3", n_sec=1200,
+                      t0_ms=t0 + 4 * 3600_000 + 1_300_000, seed=2)
+    ds = build_dataset([d1, d2, d3])
+    assert len(ds.train.x) > 0 and len(ds.val.x) > 0 and len(ds.test.x) > 0
+    # the late session (4h later) lands in val/test, not train: with 3600s
+    # total, the 85% cut sits 660s into chunk 3, so all test windows start
+    # after the 4h gap
+    assert ds.test.t_start.min() >= t0 / 1000 + 4 * 3600
+    # concatenated order is chronological, so splits stay time-ordered
+    assert ds.train.t_end.max() <= ds.val.t_start.min()
+    assert ds.val.t_end.max() <= ds.test.t_start.min()
+    all_starts = np.concatenate([ds.train.t_start, ds.val.t_start, ds.test.t_start])
+    assert len(np.unique(all_starts)) == len(all_starts)
+
+
+def test_overlapping_chunks_raise(tmp_path):
+    # Overlapping sessions would let the same market seconds land in two
+    # splits. That must fail loudly, never silently.
+    import pytest
+    t0 = 1_700_000_000_000
+    d1 = _synth_chunk(tmp_path, "c1", n_sec=1200, t0_ms=t0, seed=0)
+    d2 = _synth_chunk(tmp_path, "c2", n_sec=1200, t0_ms=t0 + 600_000, seed=1)
+    with pytest.raises(AssertionError):
+        build_dataset([d1, d2])

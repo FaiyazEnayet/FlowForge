@@ -162,11 +162,16 @@ def discriminator_auc(real_val: np.ndarray, gen_val: np.ndarray,
     with torch.no_grad():
         s_val = torch.sigmoid(model(xv)).numpy()
         s_test = torch.sigmoid(model(xt)).numpy()
+    n_pos_test = int((yt.numpy() == 1).sum())
     return {
         "auc_val": auc_score(yv.numpy(), s_val),
         "auc_test": auc_score(yt.numpy(), s_test),
         "n_val": n,
         "n_test": len(xt),
+        # raw scores on the test split, for the score-histogram figure.
+        # First n_pos_test entries are real windows, the rest generated.
+        "test_scores": s_test.astype(np.float64),
+        "test_n_real": n_pos_test,
     }
 
 

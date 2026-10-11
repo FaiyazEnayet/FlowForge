@@ -8,12 +8,12 @@ This is simulation research. Nothing here trades, connects to a trading endpoint
 
 ## How it works
 
-**Data.** My toxicflow recorder saves the top of the book (best bid and ask with sizes) ten times a second, plus every trade with its aggressor side. Six thirty minute sessions gave 10,781 seconds. I turn each second into one state vector: log return of the midprice, spread, log sizes, book imbalance, signed trade volume, trade count. Sixty seconds make one window. Windows are split by time, first 70 percent train, next 15 percent validation, last 15 percent test, and a window that straddles a boundary is dropped. The generator never sees validation or test. Standardization uses train statistics only.
+**Data.** My toxicflow recorder saves the top of the book (best bid and ask with sizes) ten times a second, plus every trade with its aggressor side. Eight thirty minute sessions gave 14,378 seconds. I turn each second into one state vector: log return of the midprice, spread, log sizes, book imbalance, signed trade volume, trade count. Sixty seconds make one window. Windows are split by position on the concatenated recording timeline, first 70 percent train, next 15 percent validation, last 15 percent test, and a window that straddles a boundary is dropped. The generator never sees validation or test. Standardization uses train statistics only. Sessions recorded hours apart would break a wall-clock split, so concatenation keeps every split populated while staying strictly chronological.
 
 **Models.** Two, both conditioned on regime features (recent volatility and spread, computed strictly from the past before each window):
 
 - A conditional VAE baseline, 289k params. Small on purpose. It is the thing to beat.
-- A DDPM diffusion model, 222k params. A small 1D conv net learns to remove noise from a window over 100 steps, conditioned on the diffusion timestep and the regime. One real bug caught along the way: my first noise schedule never reached pure noise at the last step, so sampling started from the wrong distribution and every generated window came out under dispersed. The code now asserts the schedule actually reaches noise.
+- A DDPM diffusion model, 481k params. A 1D conv net learns to remove noise from a window over 100 steps, conditioned on the diffusion timestep and the regime. Sampling uses EMA averaged weights, which proved to be the single biggest quality win. One real bug caught along the way: my first noise schedule never reached pure noise at the last step, so sampling started from the wrong distribution and every generated window came out under dispersed. The code now asserts the schedule actually reaches noise.
 
 **Evaluation.** This is the deliverable. On the held out test split:
 
@@ -25,11 +25,17 @@ Every metric was sanity checked on synthetic inputs with known answers first: Wa
 
 ## What I found
 
-Real numbers from `examples/demo.py`, seed 7, about 1.2 minutes of CPU training. 672 train windows, 166 validation, 168 test.
+Real numbers from `examples/demo.py`, seed 7, about 11 minutes of CPU training. Eight thirty minute sessions, 14,378 seconds of book data, 937 train windows, 199 validation, 198 test. The diffusion model is bigger this time: 481k params, 300 epochs, EMA weight averaging for sampling. The VAE baseline is unchanged.
 
-The diffusion model beats the VAE clearly. Mean Wasserstein distance across features: 0.267 vs 0.356. Discriminator AUC on the held out test split: 0.734 vs 0.915. The VAE collapses to conditional means, generating about a fifth of the real variance on most features, and even invents fake autocorrelation the real data does not have (0.28 at lag 4 vs 0.00 real). The diffusion model matches variances closely (returns 0.605 vs 0.568 real, imbalance 0.840 vs 0.879, signed flow 0.321 vs 0.334) and reproduces the flat autocorrelation.
+![Real vs dreamed market windows](runs/figures/windows.png)
 
-Honest gaps. The discriminator still separates diffusion output from real windows at 0.734, so the dreams are good but not perfect. There are mean shifts on some features (imbalance -0.31 generated vs 0.21 real). And one data truth worth knowing: the BTC spread sits pinned at one tick most of the time, so the spread feature is nearly a point mass and mostly tests whether the generator reproduces that.
+The diffusion model beats the VAE clearly. Mean Wasserstein distance across features: 0.276 vs 0.536. Discriminator AUC on the held out test split: 0.669 vs 0.937. The VAE still collapses to conditional means, generating a fraction of the real variance. The diffusion model matches variances far better and reproduces the flat autocorrelation of signed order flow that the real data shows.
+
+![Discriminator scores, real vs generated](runs/figures/discriminator.png)
+
+Two gaps closed since the first version. The discriminator AUC fell from 0.734 to 0.669: the classifier still separates dreams from reality, but noticeably worse than before. The imbalance mean shift shrank from 0.52 to 0.17 in standardized units. What worked: longer training, EMA sampling weights, a larger denoiser, and two extra hours of recordings from a different time of day. What did not move the needle much on its own: model size without EMA.
+
+Honest gaps that remain. The discriminator still wins at 0.669, so the dreams are good but not perfect. The spread feature is nearly a point mass in this data (BTC spread pinned at one tick), which mostly tests whether the generator reproduces that. Book sizes remain the hardest feature: the generator underplays their variance. And one data truth: eight sessions across two evenings is still one asset in one mood. Different regimes would give different numbers.
 
 ## Quickstart
 
@@ -38,7 +44,7 @@ python3 -m venv .venv && .venv/bin/pip install torch --index-url https://downloa
 .venv/bin/pip install numpy pandas pyarrow pytest
 
 # build windows from toxicflow recordings (data/ is gitignored, rebuild it)
-PYTHONPATH=. .venv/bin/python examples/build_data.py ~/workspace/toxicflow/data/chunk1 .../chunk6
+PYTHONPATH=. .venv/bin/python examples/build_data.py ~/workspace/toxicflow/data/chunk1 .../chunk8
 
 # train both models and print the full evaluation
 PYTHONPATH=. .venv/bin/python examples/demo.py
@@ -49,16 +55,16 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/ -q
 
 ## What is in here
 
-- `flowforge/data.py`: parquet to standardized windows, time based splits, leakage discipline documented in the docstring.
-- `flowforge/models.py`: conditional VAE baseline and the DDPM (1D conv denoiser, regime conditioning, validated noise schedule).
+- `flowforge/data.py`: parquet to standardized windows, concatenated timeline splits, overlap guard, leakage discipline documented in the docstring.
+- `flowforge/models.py`: conditional VAE baseline and the DDPM (1D conv denoiser, regime conditioning, validated noise schedule, EMA sampling weights).
 - `flowforge/evaluate.py`: Wasserstein distances, autocorrelation, the held out discriminator with fixed seeds, plus a printable report.
-- `examples/demo.py`: end to end training and evaluation. `examples/build_data.py`: rebuild the window dataset.
-- `tests/`: 18 tests. Shapes, NaN handling, no time overlap between splits, and every metric checked against synthetic inputs with known answers.
+- `examples/demo.py`: end to end training and evaluation. `examples/build_data.py`: rebuild the window dataset. `examples/sweep.py`: model config sweep on the validation split. `examples/figures.py`: the real vs dreamed plots.
+- `tests/`: 23 tests. Shapes, NaN handling, no time overlap between splits, EMA roundtrips, and every metric checked against synthetic inputs with known answers.
 
 ## Honest limitations
 
-- Small models on CPU, three hours of one asset. This is a proof of concept, not a production simulator.
+- Small models on CPU, four hours of one asset across two evenings. This is a proof of concept, not a production simulator.
 - BTCUSDT spot only. Crypto microstructure is not equities: no open or close, different fee structure, 24/7 retail flow.
 - The recorder saves only the touch, not full depth, so the model learns top of book dynamics only.
-- One calm three hour session. Different regimes would give different numbers.
+- Two evenings of BTCUSDT spot. Different regimes would give different numbers, and one volatile session would teach the model things this calm data cannot.
 - Research code, not trading advice. Nothing here should touch real money.

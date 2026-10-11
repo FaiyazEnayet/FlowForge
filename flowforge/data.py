@@ -18,9 +18,13 @@ book-state vector built from 1s bars of quotes plus signed trade flow:
 
 Leakage discipline (non-negotiable):
   - Bars are standardized with mean/std fit on the TRAIN split only.
-  - Windows are assigned to train/val/test by their time position. A window
-    belongs to a split only if it lies fully inside that split's time range,
-    so no window content is ever shared between splits.
+  - Windows are assigned to train/val/test by their position on the
+    concatenated recording timeline (chunks in chronological order, first
+    70% train, next 15% val, last 15% test). Absolute-clock splits break
+    when sessions are hours apart, so concatenation keeps every split
+    populated while staying strictly chronological. A window belongs to a
+    split only if it lies fully inside that split's range, so no window
+    content is ever shared between splits.
   - Windows never cross chunk boundaries (recording gaps/resyncs): seconds
     are segmented per chunk and a gap longer than MAX_GAP_S starts a new
     segment. Windows are built inside segments only.
@@ -153,19 +157,38 @@ def build_dataset(chunk_dirs: list[str]) -> BookDataset:
         raise ValueError("no usable bars in any chunk")
     n_seconds = int(sum(len(b) for b in all_bars))
 
-    # global time cuts for the split (by absolute second)
-    t_min = min(b.index.min() for b in all_bars)
-    t_max = max(b.index.max() for b in all_bars)
-    span = t_max - t_min
-    cut1 = t_min + TRAIN_FRAC * span
-    cut2 = t_min + (TRAIN_FRAC + VAL_FRAC) * span
-    splits = {"train": (t_min, cut1), "val": (cut1, cut2), "test": (cut2, t_max)}
+    # Split by position on the concatenated recording timeline (chunks in
+    # chronological order). Splitting by absolute clock time breaks when
+    # sessions are hours apart: the middle split can land entirely inside a
+    # recording gap. Concatenated order keeps the split chronological with
+    # zero leakage, and puts later sessions (different time of day) in test.
+    order = sorted(range(len(all_bars)),
+                   key=lambda i: all_bars[i].index.min())
+    ordered = [all_bars[i] for i in order]
+    # guard: overlapping sessions would put the same market seconds in two
+    # chunks, which the concatenated split could then separate into
+    # different splits (silent leakage). Recordings are sequential, so
+    # overlap is always a data bug. Fail loudly.
+    for prev, cur in zip(ordered[:-1], ordered[1:]):
+        assert cur.index.min() > prev.index.max(), \
+            "chunk time ranges overlap; sort/deduplicate recording sessions"
+    chunk_t0 = [b.index.min() for b in ordered]
+    spans = [int(b.index.max() - b.index.min()) + 1 for b in ordered]
+    total = sum(spans)
+    cut1 = TRAIN_FRAC * total
+    cut2 = (TRAIN_FRAC + VAL_FRAC) * total
+    offsets = []
+    acc = 0
+    for s in spans:
+        offsets.append(acc)
+        acc += s
+    splits = {"train": (0.0, cut1), "val": (cut1, cut2), "test": (cut2, float(total))}
 
     raw: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_regime: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_t: dict[str, list] = {"train": [], "val": [], "test": []}
 
-    for b in all_bars:
+    for ci, b in enumerate(ordered):
         for seg in _segments(b):
             if len(seg) < LOOKBACK + WINDOW:
                 continue
@@ -175,9 +198,13 @@ def build_dataset(chunk_dirs: list[str]) -> BookDataset:
             spread = seg["spread_bps"].to_numpy(dtype=np.float64)
             for start, end in _windows_in_segment(seg):
                 w_t0, w_t1 = secs[start], secs[end - 1]
+                # position on the concatenated timeline (chunk offset +
+                # seconds since this chunk started)
+                c0 = offsets[ci] + (w_t0 - chunk_t0[ci])
+                c1 = offsets[ci] + (w_t1 - chunk_t0[ci])
                 split = None
                 for name, (lo, hi) in splits.items():
-                    if w_t0 >= lo and w_t1 <= hi:
+                    if c0 >= lo and c1 <= hi:
                         split = name
                         break
                 if split is None:  # straddles a cut: drop, never share

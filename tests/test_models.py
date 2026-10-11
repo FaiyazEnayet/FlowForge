@@ -4,8 +4,9 @@ import numpy as np
 import torch
 
 from flowforge.data import N_FEATURES, WINDOW
-from flowforge.models import (BookDDPM, CondVAE, count_params, set_seed,
-                              train_ddpm, train_vae, vae_loss)
+from flowforge.models import (BookDDPM, CondVAE, EMA, count_params,
+                              sample_with_ema, set_seed, train_ddpm,
+                              train_vae, vae_loss)
 
 
 def _batch(n=8):
@@ -64,5 +65,34 @@ def test_short_train_runs():
     h = train_vae(vae, x, r, epochs=2, batch=16, seed=0, verbose=False)
     assert len(h) == 2 and all(np.isfinite(h))
     ddpm = BookDDPM(t_steps=10)
-    h = train_ddpm(ddpm, x, r, epochs=2, batch=16, seed=0, verbose=False)
-    assert len(h) == 2 and all(np.isfinite(h))
+    h, ema = train_ddpm(ddpm, x, r, epochs=2, batch=16, seed=0, verbose=False)
+    assert len(h) == 2 and all(np.isfinite(h)) and ema is None
+    h, ema = train_ddpm(ddpm, x, r, epochs=2, batch=16, seed=0, verbose=False,
+                        ema_decay=0.9)
+    assert len(h) == 2 and ema is not None
+    # EMA shadow weights track the model weights
+    for n, p in ddpm.named_parameters():
+        if p.requires_grad:
+            assert torch.allclose(ema.shadow[n], p.detach(), atol=1e-3)
+
+
+def test_ema_apply_restore_roundtrip():
+    _, r = _batch(n=4)
+    m = BookDDPM(t_steps=10)
+    ema = EMA(m, decay=0.0)  # decay 0 -> shadow snaps to latest weights
+    before = {n: p.detach().clone() for n, p in m.named_parameters()
+              if p.requires_grad}
+    ema.apply_to(m)
+    ema.restore(m)
+    for n, p in m.named_parameters():
+        if p.requires_grad:
+            assert torch.equal(p, before[n])
+
+
+def test_sample_with_ema_shape():
+    _, r = _batch(n=4)
+    m = BookDDPM(t_steps=10)
+    ema = EMA(m)
+    g = sample_with_ema(m, ema, r, seed=0)
+    assert g.shape == (4, WINDOW, N_FEATURES)
+    assert torch.isfinite(g).all()

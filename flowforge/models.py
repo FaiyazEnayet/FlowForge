@@ -230,9 +230,11 @@ class BookDDPM(nn.Module):
 
 def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
                epochs: int = 12, batch: int = 32, lr: float = 2e-4,
-               seed: int = 0, verbose: bool = True) -> list[float]:
+               seed: int = 0, verbose: bool = True,
+               ema_decay: float | None = None) -> tuple[list[float], EMA | None]:
     set_seed(seed)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    ema = EMA(model, ema_decay) if ema_decay is not None else None
     n = x.shape[0]
     xc = x.permute(0, 2, 1).contiguous()  # (B, F, L)
     hist = []
@@ -245,13 +247,63 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
             opt.zero_grad()
             loss.backward()
             opt.step()
+            if ema is not None:
+                ema.update(model)
             tot += loss.item()
             nb += 1
         hist.append(tot / nb)
-        if verbose:
+        if verbose and (ep % 20 == 0 or ep == epochs - 1):
             print(f"  ddpm epoch {ep:3d} loss {hist[-1]:.4f}", flush=True)
-    return hist
+    return hist, ema
+
+
+@torch.no_grad()
+def sample_with_ema(model: BookDDPM, ema: EMA, regime: torch.Tensor,
+                    seed: int = 0) -> torch.Tensor:
+    """Sample from EMA weights, then restore the training weights."""
+    ema.apply_to(model)
+    try:
+        return model.sample(regime, seed=seed)
+    finally:
+        ema.restore(model)
 
 
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
+
+
+# ------------------------------------------------------------ EMA averaging
+
+class EMA:
+    """Exponential moving average of model weights. Standard DDPM practice:
+    sampling from the EMA weights is more stable than from the raw
+    training weights, especially late in training."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {n: p.detach().clone()
+                       for n, p in model.named_parameters() if p.requires_grad}
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module) -> None:
+        """Swap EMA weights in, keeping a backup of the current weights."""
+        self._backup = {n: p.detach().clone()
+                        for n, p in model.named_parameters() if p.requires_grad}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.shadow[n].to(p.device))
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        assert self._backup is not None, "apply_to() must be called first"
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self._backup[n].to(p.device))
+        self._backup = None
