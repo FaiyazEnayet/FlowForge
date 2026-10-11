@@ -12,7 +12,7 @@ This is simulation research. Nothing here trades, connects to a trading endpoint
 
 ## Live interactive demo
 
-[![FlowForge dashboard preview](docs/demo.gif)](https://faiyazenayet.github.io/flowforge/docs/dashboard.html)
+[![FlowForge dashboard preview](docs/demo.gif?v=2)](https://faiyazenayet.github.io/flowforge/docs/dashboard.html)
 
 **[Open the interactive dashboard](https://faiyazenayet.github.io/flowforge/docs/dashboard.html).** Flip through real vs dreamed market windows, inspect the discriminator scores, and read the full evaluation tables. It is one self-contained HTML file, so it runs anywhere and is ready for GitHub Pages. The animation above is rendered from the same data by `examples/make_gif.py`.
 
