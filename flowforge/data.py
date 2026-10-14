@@ -210,8 +210,9 @@ def build_dataset(chunk_dirs: list[str]) -> BookDataset:
                 if split is None:  # straddles a cut: drop, never share
                     continue
                 win = arr[start:end]
-                # regime from strictly-past lookback
-                lb_ret = np.diff(np.log(mid[start - LOOKBACK:start + 1]))
+                # regime from strictly-past lookback: ends at the window
+                # start, never includes the window itself
+                lb_ret = np.diff(np.log(mid[start - LOOKBACK:start]))
                 vol = float(np.std(lb_ret)) if len(lb_ret) else 0.0
                 sp = float(np.mean(spread[start - LOOKBACK:start]))
                 raw[split].append(win)
