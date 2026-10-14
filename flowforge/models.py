@@ -176,10 +176,8 @@ class BookDDPM(nn.Module):
         self.net = Denoiser(n_features=n_features, window=window, ch=ch,
                             n_blocks=n_blocks, **kw)
         self.t_steps = t_steps
-        # Linear schedule with beta_end chosen so alpha_bar_T ~ 0.02: the
-        # reverse chain must start from ~pure noise, and per-step betas must
-        # stay small enough that an imperfect denoiser does not blow up the
-        # ancestral sampler. (A cosine schedule was tried and diverged.)
+        # Linear schedule. beta_end picked so alpha_bar_T ~ 0.02: sampling
+        # has to start from ~pure noise. (Cosine was tried, it diverged.)
         betas = torch.linspace(beta_start, beta_end, t_steps)
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)
@@ -187,9 +185,9 @@ class BookDDPM(nn.Module):
         self.register_buffer("alphas_cumprod", acp)
         self.register_buffer("sqrt_acp", torch.sqrt(acp))
         self.register_buffer("sqrt_1m_acp", torch.sqrt(1.0 - acp))
-        # sanity: at realistic step counts the chain must actually reach pure
-        # noise, otherwise sampling starts from the wrong distribution and
-        # generated variance collapses (this exact bug bit once already)
+        # The chain has to actually reach pure noise, or sampling starts
+        # from the wrong distribution and generated variance collapses.
+        # This exact bug bit once already.
         if t_steps >= 50:
             assert float(acp[-1]) < 0.05, f"alpha_bar_T={float(acp[-1]):.3f}; schedule broken"
         self.window = window
@@ -275,9 +273,8 @@ def count_params(model: nn.Module) -> int:
 # ------------------------------------------------------------ EMA averaging
 
 class EMA:
-    """Exponential moving average of model weights. Standard DDPM practice:
-    sampling from the EMA weights is more stable than from the raw
-    training weights, especially late in training."""
+    """Exponential moving average of model weights. Sampling from the EMA
+    weights is more stable than from the raw training weights."""
 
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay

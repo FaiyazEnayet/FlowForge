@@ -48,11 +48,11 @@ Every metric was sanity checked on synthetic inputs with known answers first: Wa
 
 ## What I found
 
-Real numbers from `examples/demo.py`, seed 7, about 11 minutes of CPU training (timing varies with hardware). Eight thirty minute sessions, 14,378 seconds of book data, 937 train windows, 199 validation, 198 test. The diffusion model: 481k params, 300 epochs, EMA weight averaging for sampling. The VAE baseline is unchanged.
+Real numbers from `examples/demo.py`, seed 7, about 12 minutes of CPU training (timing varies with hardware). Eight thirty minute sessions, 14,378 seconds of book data, 937 train windows, 199 validation, 198 test. The diffusion model: 481k params, 300 epochs, EMA weight averaging for sampling. The VAE baseline is unchanged.
 
 ![Real vs dreamed market windows](runs/figures/93b6b5f7-7be6-49c9-8efc-d4a392e71be5.png)
 
-The diffusion model beats the VAE clearly. Mean Wasserstein distance across features: 0.276 vs 0.536. Discriminator AUC on the held out test split: 0.669 vs 0.937. The VAE still collapses to conditional means, generating a fraction of the real variance. The diffusion model matches variances far better and reproduces the flat autocorrelation of signed order flow that the real data shows.
+The diffusion model beats the VAE clearly. Mean Wasserstein distance across features: 0.277 vs 0.527. Discriminator AUC on the held out test split: 0.669 vs 0.956. The VAE still collapses to conditional means, generating a fraction of the real variance. The diffusion model matches variances far better and reproduces the flat autocorrelation of signed order flow that the real data shows.
 
 ![Discriminator scores, real vs generated](runs/figures/da11d860-69a5-40fb-82f5-ec02c2d4b1cc.png)
 

@@ -51,7 +51,7 @@ def load_demo_bundle(bundle_path: str = DEFAULT_BUNDLE,
                      metrics_path: str = DEFAULT_METRICS) -> dict:
     """Load and validate the committed demo bundle.
 
-    Raises FileNotFoundError if the bundle is missing and ValueError if it is
+    Raises FileNotFoundError if the bundle is missing, ValueError if it is
     malformed (missing keys, wrong shapes, non-finite values).
     """
     if not os.path.exists(bundle_path):
