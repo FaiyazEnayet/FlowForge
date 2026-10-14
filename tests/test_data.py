@@ -1,5 +1,7 @@
 """Data pipeline tests: shapes, NaN handling, and the no-leakage guarantee."""
 
+import shutil
+
 import numpy as np
 import pandas as pd
 
@@ -81,7 +83,39 @@ def test_save_load_roundtrip(tmp_path):
     assert ds2.n_chunks == ds.n_chunks
 
 
-def test_large_gap_between_chunks_keeps_splits_populated(tmp_path):    # Regression test: chunks recorded hours apart must not leave a split
+def test_regime_uses_strictly_past_data(tmp_path):
+    # Regression test: regime features for a window must not move when data
+    # at or after the window start changes. The lookback ends at the window
+    # start, so perturbing quotes from one window start onward must leave
+    # that window's regime untouched.
+    t0 = 1_700_000_000_000
+    d1 = _synth_chunk(tmp_path, "c1", n_sec=1200, t0_ms=t0, seed=0)
+    ds = build_dataset([d1])
+
+    # cut lands exactly on a window start: bars drop the first second, so
+    # window starts sit at t0 + 1 + {60, 70, ...}; 1090 is one of them.
+    cut_sec = t0 // 1000 + 1 + 1090
+    cut_ms = cut_sec * 1000
+    d2 = tmp_path / "c2"
+    d2.mkdir()
+    q = pd.read_parquet(f"{d1}/quotes.parquet")
+    after = q["time"] >= cut_ms
+    q.loc[after, "bid_px"] *= 1.5
+    q.loc[after, "ask_px"] *= 1.5
+    q.to_parquet(d2 / "quotes.parquet")
+    shutil.copy(tmp_path / "c1" / "trades.parquet", d2 / "trades.parquet")
+    ds2 = build_dataset([str(d2)])
+
+    assert np.array_equal(ds.test.t_start, ds2.test.t_start)
+    idx = int(np.where(ds.test.t_start == cut_sec)[0][0])
+    assert np.array_equal(ds.test.regime[idx], ds2.test.regime[idx])
+    # the perturbation was real: the last test window's lookback covers
+    # the cut, so its volatility moves
+    assert not np.array_equal(ds.test.regime[-1], ds2.test.regime[-1])
+
+
+def test_large_gap_between_chunks_keeps_splits_populated(tmp_path):
+    # Regression test: chunks recorded hours apart must not leave a split
     # empty. The split runs on the concatenated recording timeline, so the
     # later session lands in test (different time of day by design).
     t0 = 1_700_000_000_000
