@@ -1,17 +1,25 @@
 """Evaluation: do generated windows look like real ones?
 
-Three families of checks, all computed on HELD-OUT data the generator never
+Four families of checks, all computed on HELD-OUT data the generator never
 saw during training (the test split):
 
 1. Marginal distributions: for each book-state feature, compare real vs
    generated pooled values by mean, std, and the 1-Wasserstein distance.
 2. Temporal structure: autocorrelation of signed order flow at lags 1..5,
-   real vs generated. Real flow is positively autocorrelated at short lags
-   (parent orders split into children); a good generator reproduces that.
-3. TSTR-style discriminator: train a classifier to tell real from generated
-   windows. It is trained on the VAL split (real val windows vs generated
-   windows conditioned on val regimes) and its AUC is reported on the TEST
-   split. Fixed seeds throughout. AUC near 0.5 means the generator fools it.
+   real vs generated. Each window is a genuine continuous 60s series, so the
+   autocorrelation is computed per window and averaged, with 95% confidence
+   intervals. In this dataset the real flow is near flat at these lags; a
+   good generator reproduces that.
+3. Real-vs-generated discriminator: train a classifier to tell real from
+   generated windows. It is trained on the VAL split (real val windows vs
+   generated windows conditioned on val regimes) and its AUC is reported on
+   the TEST split. Fixed seeds throughout. AUC near 0.5 means the generator
+   fools it.
+4. TSTR (train on synthetic, test on real): train a small model to predict
+   near-term flow direction on generated windows and test it on real test
+   windows, next to the same model trained on real windows. This asks whether
+   synthetic data is *useful*, a different question from whether it is
+   *indistinguishable* (check 3). A generator can pass one and fail the other.
 
 Every metric in this file has a synthetic sanity check in the test suite
 with a known answer (e.g. Wasserstein distance of two identical
@@ -101,14 +109,43 @@ def marginal_table(real: np.ndarray, gen: np.ndarray) -> dict:
             "mean_w1": float(np.mean([r["w1"] for r in rows]))}
 
 
+def _mean_ci(x: np.ndarray, z: float = 1.96) -> list[float]:
+    """95% confidence interval for the mean (normal approximation)."""
+    x = np.asarray(x, dtype=np.float64).ravel()
+    x = x[np.isfinite(x)]
+    if len(x) < 2:
+        return [float("nan"), float("nan")]
+    se = x.std(ddof=1) / np.sqrt(len(x))
+    m = float(x.mean())
+    return [m - z * se, m + z * se]
+
+
 def flow_acf_table(real: np.ndarray, gen: np.ndarray,
                    lags: tuple[int, ...] = (1, 2, 3, 4, 5)) -> dict:
-    """Autocorrelation of signed order flow, concatenated across windows."""
+    """Mean autocorrelation of signed order flow, averaged across windows.
+
+    Each window is a genuine continuous series, so the autocorrelation is
+    computed per window and averaged. Concatenating overlapping windows
+    instead would duplicate most of the data and scramble temporal order at
+    the junctions. Windows overlap (stride < window length), so the
+    confidence intervals are approximate.
+    """
     j = FEATURE_NAMES.index("signed_flow")
-    r = np.concatenate([w[:, j] for w in real])
-    g = np.concatenate([w[:, j] for w in gen])
-    rows = [{"lag": lag, "real_acf": acf(r, lag), "gen_acf": acf(g, lag)}
-            for lag in lags]
+    rows = []
+    for lag in lags:
+        r = np.array([acf(w[:, j], lag) for w in real], dtype=np.float64)
+        g = np.array([acf(w[:, j], lag) for w in gen], dtype=np.float64)
+        r = r[np.isfinite(r)]
+        g = g[np.isfinite(g)]
+        rows.append({
+            "lag": lag,
+            "real_acf": float(r.mean()) if len(r) else float("nan"),
+            "real_ci": _mean_ci(r),
+            "gen_acf": float(g.mean()) if len(g) else float("nan"),
+            "gen_ci": _mean_ci(g),
+            "n_real": int(len(r)),
+            "n_gen": int(len(g)),
+        })
     return {"rows": rows}
 
 
@@ -175,6 +212,68 @@ def discriminator_auc(real_val: np.ndarray, gen_val: np.ndarray,
     }
 
 
+# ------------------------------------------------------------------ TSTR
+
+def _tstr_xy(windows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """First-half feature means -> second-half signed-flow direction."""
+    j = FEATURE_NAMES.index("signed_flow")
+    half = windows.shape[1] // 2
+    x = np.asarray(windows[:, :half, :], dtype=np.float64).mean(axis=1)
+    y = (np.asarray(windows[:, half:, j], dtype=np.float64).mean(axis=1) > 0)
+    return x, y.astype(np.float64)
+
+
+def tstr_flow_direction(real_val: np.ndarray, gen_val: np.ndarray,
+                        real_test: np.ndarray, seed: int = 0,
+                        epochs: int = 300) -> dict:
+    """Train on synthetic, test on real: is the generated data useful?
+
+    A logistic regression predicts the sign of second-half signed order
+    flow from first-half feature means. One copy trains on generated
+    windows, the baseline trains on real val windows; both are tested on
+    real test windows. Fixed seed. Majority-class accuracy is reported so
+    the numbers have a scale.
+    """
+    xs, ys = _tstr_xy(gen_val)
+    xr, yr = _tstr_xy(real_val)
+    xt, yt = _tstr_xy(real_test)
+
+    def fit(x, y):
+        set_seed(seed)
+        mu, sd = x.mean(axis=0), x.std(axis=0) + 1e-8
+        w = torch.zeros(x.shape[1] + 1, dtype=torch.float32,
+                        requires_grad=True)
+        opt = torch.optim.Adam([w], lr=0.1)
+        bce = nn.BCEWithLogitsLoss()
+        xb = torch.from_numpy(
+            np.column_stack([(x - mu) / sd, np.ones(len(x))]).astype(np.float32))
+        yb = torch.from_numpy(y.astype(np.float32))
+        for _ in range(epochs):
+            opt.zero_grad()
+            loss = bce(xb @ w, yb)
+            loss.backward()
+            opt.step()
+        return w.detach().numpy(), mu, sd
+
+    def accuracy(w, mu, sd, x, y):
+        s = 1.0 / (1.0 + np.exp(-((x - mu) / sd @ w[:-1] + w[-1])))
+        return float(((s > 0.5) == (y > 0.5)).mean())
+
+    out = {
+        "n_train_synth": int(len(xs)),
+        "n_train_real": int(len(xr)),
+        "n_test": int(len(xt)),
+        "majority": float(max(yt.mean(), 1.0 - yt.mean())) if len(yt) else float("nan"),
+    }
+    for name, (x, y) in (("synth", (xs, ys)), ("real", (xr, yr))):
+        if len(np.unique(y)) < 2 or len(np.unique(yt)) < 2:
+            out[f"acc_{name}"] = float("nan")
+        else:
+            w, mu, sd = fit(x, y)
+            out[f"acc_{name}"] = accuracy(w, mu, sd, xt, yt)
+    return out
+
+
 def full_report(real_test: np.ndarray, gen_test: np.ndarray,
                 real_val: np.ndarray, gen_val: np.ndarray,
                 seed: int = 0) -> dict:
@@ -183,6 +282,7 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
         "flow_acf": flow_acf_table(real_test, gen_test),
         "discriminator": discriminator_auc(real_val, gen_val, real_test, gen_test,
                                            seed=seed),
+        "tstr": tstr_flow_direction(real_val, gen_val, real_test, seed=seed),
     }
 
 
@@ -194,12 +294,25 @@ def print_report(rep: dict) -> None:
         print(f"{r['feature']:<16}{r['real_mean']:>10.3f}{r['gen_mean']:>10.3f}"
               f"{r['real_std']:>10.3f}{r['gen_std']:>10.3f}{r['w1']:>10.3f}")
     print(f"mean W1 across features: {rep['marginals']['mean_w1']:.3f}")
-    print("\n=== signed order flow autocorrelation ===")
-    print(f"{'lag':>4}{'real_acf':>10}{'gen_acf':>10}")
+    print("\n=== signed order flow autocorrelation "
+          "(mean across windows, 95% CI) ===")
     for r in rep["flow_acf"]["rows"]:
-        print(f"{r['lag']:>4}{r['real_acf']:>10.3f}{r['gen_acf']:>10.3f}")
+        print(f"lag {r['lag']}: real {r['real_acf']:.3f} "
+              f"[{r['real_ci'][0]:.3f}, {r['real_ci'][1]:.3f}] (n={r['n_real']})"
+              f" | gen {r['gen_acf']:.3f} "
+              f"[{r['gen_ci'][0]:.3f}, {r['gen_ci'][1]:.3f}] (n={r['n_gen']})")
     d = rep["discriminator"]
-    print("\n=== discriminator (trained on val, tested on test) ===")
+    print("\n=== real-vs-generated discriminator "
+          "(trained on val, tested on test) ===")
     print(f"AUC on val: {d['auc_val']:.3f} | AUC on test: {d['auc_test']:.3f} "
           f"(0.5 = indistinguishable)")
     print(f"(n_val={d['n_val']}, n_test={d['n_test']}, seed fixed)")
+    t = rep["tstr"]
+    print("\n=== TSTR: train on synthetic, test on real "
+          "(flow direction) ===")
+    print(f"synthetic-trained accuracy: {t['acc_synth']:.3f} | "
+          f"real-trained accuracy: {t['acc_real']:.3f} | "
+          f"majority baseline: {t['majority']:.3f}")
+    print(f"(n_train_synth={t['n_train_synth']}, "
+          f"n_train_real={t['n_train_real']}, n_test={t['n_test']}, "
+          f"seed fixed)")
