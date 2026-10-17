@@ -240,10 +240,20 @@ demo bundle (<code>demo/</code>), which comes from
 """
     os.makedirs(DOCS, exist_ok=True)
     out = os.path.join(DOCS, "dashboard.html")
-    with open(out, "w") as f:
-        f.write(html)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(_portfolio_html(html))
     print(f"dashboard -> {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
 
+
+
+def _portfolio_html(raw):
+    """Presentation-only transform of this run’s freshly calculated figures."""
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(root / "portfolio_ui"))
+    from renderer import render_html
+    return render_html(root, 'FlowForge', raw)[0]
 
 if __name__ == "__main__":
     main()
