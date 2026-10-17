@@ -1,0 +1,6 @@
+-r requirements.txt
+matplotlib>=3.6
+pillow>=9
+fonttools>=4
+brotli>=1
+numpy>=1.24
