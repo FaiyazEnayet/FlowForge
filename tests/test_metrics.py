@@ -5,7 +5,10 @@ Rule: if any of these fail, the metric is wrong, not the test.
 
 import numpy as np
 
-from flowforge.evaluate import acf, auc_score, discriminator_auc, wasserstein_1d
+from flowforge.data import FEATURE_NAMES
+from flowforge.evaluate import (acf, auc_score, discriminator_auc,
+                                flow_acf_table, tstr_flow_direction,
+                                wasserstein_1d)
 
 
 def test_wasserstein_identical_is_zero():
@@ -97,3 +100,62 @@ def test_discriminator_returns_test_scores():
     assert int(out["test_n_real"]) == n_r
     assert np.isfinite(scores).all()
     assert (scores >= 0).all() and (scores <= 1).all()
+
+
+def test_flow_acf_averages_per_window():
+    # Level-shifted regimes: concatenating overlapping windows (the old bug)
+    # centers on the grand mean and reports near-1.0 autocorrelation, while
+    # per-window averaging recovers the true AR(1) coefficient.
+    rng = np.random.default_rng(11)
+    phi = 0.3
+    j = FEATURE_NAMES.index("signed_flow")
+    wins = rng.normal(size=(40, 60, 7)) * 0.1
+    for rows, mean in ((slice(0, 20), 5.0), (slice(20, 40), -5.0)):
+        e = rng.normal(size=(20, 60))
+        x = np.zeros_like(e)
+        for i in range(1, 60):
+            x[:, i] = phi * x[:, i - 1] + e[:, i]
+        wins[rows, :, j] = mean + x
+    row = flow_acf_table(wins, wins)["rows"][0]
+    assert abs(row["real_acf"] - phi) < 0.15, row
+    assert row["real_ci"][0] <= row["real_acf"] <= row["real_ci"][1]
+    assert row["n_real"] == 40
+
+
+def test_flow_acf_ci_covers_truth():
+    # On plain AR(1) windows the 95% CI should contain the true coefficient.
+    # Long windows: the per-window autocorrelation estimator has a
+    # finite-sample downward bias that vanishes as the window grows.
+    rng = np.random.default_rng(12)
+    phi = 0.5
+    j = FEATURE_NAMES.index("signed_flow")
+    e = rng.normal(size=(120, 600))
+    x = np.zeros_like(e)
+    for i in range(1, 600):
+        x[:, i] = phi * x[:, i - 1] + e[:, i]
+    wins = np.zeros((120, 600, 7))
+    wins[:, :, j] = x
+    row = flow_acf_table(wins, wins)["rows"][0]
+    assert row["real_ci"][0] <= phi <= row["real_ci"][1], row
+
+
+def test_tstr_recovers_learnable_structure():
+    # Synthetic windows where first-half imbalance determines second-half
+    # flow direction: both the synthetic-trained and real-trained models
+    # must ace it, or the TSTR machinery is broken.
+    rng = np.random.default_rng(13)
+    j_imb = FEATURE_NAMES.index("imbalance")
+    j_sf = FEATURE_NAMES.index("signed_flow")
+
+    def make(n):
+        w = rng.normal(size=(n, 60, 7)) * 0.1
+        s = rng.choice([-1.0, 1.0], size=n)
+        w[:, :30, j_imb] += s[:, None] * 2.0
+        w[:, 30:, j_sf] += s[:, None] * 2.0
+        return w
+
+    out = tstr_flow_direction(make(60), make(60), make(60), seed=0)
+    assert out["acc_synth"] > 0.9, out
+    assert out["acc_real"] > 0.9, out
+    assert 0.0 <= out["majority"] <= 1.0
+    assert out["n_test"] == 60

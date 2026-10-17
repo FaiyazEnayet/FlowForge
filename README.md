@@ -41,22 +41,25 @@ flowchart LR
 **Evaluation.** This is the deliverable. On the held out test split:
 
 1. Marginal distributions. For each of the seven features: real vs generated mean, std, and 1-Wasserstein distance.
-2. Temporal structure. Autocorrelation of signed order flow at lags 1 to 5. In this sample the real flow is near zero at one second bars, so the check is whether the generator reproduces that flatness instead of inventing structure.
+2. Temporal structure. Autocorrelation of signed order flow at lags 1 to 5, computed per window and averaged, with 95% confidence intervals. In this sample the real flow is near zero at one second bars, so the check is whether the generator reproduces that flatness instead of inventing structure.
 3. A discriminator test. Train a classifier on validation windows (real vs generated) and report its AUC on test windows the generator never saw. Fixed seeds. AUC near 0.5 means the dreams are indistinguishable.
+4. TSTR: train on synthetic, test on real. A small model learns to predict near-term flow direction from generated windows and is tested on real test windows, next to the same model trained on real windows. This asks whether the dreams are useful, which is a different question from whether they are indistinguishable.
 
 Every metric was sanity checked on synthetic inputs with known answers first: Wasserstein of identical distributions is ~0 and of N(0,1) vs N(2,1) is ~2, autocorrelation recovers 0.8 on AR(1) data, the discriminator scores ~0.5 on identical distributions and ~1.0 on separated ones. If a check had failed I would have fixed the metric, not the test.
 
 ## What I found
 
-Real numbers from `examples/demo.py`, seed 7, about 12 minutes of CPU training (timing varies with hardware). Eight thirty minute sessions, 14,378 seconds of book data, 937 train windows, 199 validation, 198 test. The diffusion model: 481k params, 300 epochs, EMA weight averaging for sampling. The VAE baseline is unchanged.
+Real numbers from `examples/demo.py`, seed 7, about 15 minutes of CPU training (timing varies with hardware). Eight thirty minute sessions, 14,378 seconds of book data, 937 train windows, 199 validation, 198 test. The diffusion model: 481k params, 300 epochs, EMA weight averaging for sampling. The VAE baseline is unchanged.
 
 ![Real vs dreamed market windows](runs/figures/93b6b5f7-7be6-49c9-8efc-d4a392e71be5.png)
 
-The diffusion model beats the VAE clearly. Mean Wasserstein distance across features: 0.277 vs 0.527. Discriminator AUC on the held out test split: 0.669 vs 0.956. The VAE still collapses to conditional means, generating a fraction of the real variance. The diffusion model matches variances far better and reproduces the flat autocorrelation of signed order flow that the real data shows.
+The diffusion model beats the VAE clearly. Mean Wasserstein distance across features: 0.280 vs 0.527. Discriminator AUC on the held out test split: 0.741 vs 0.956. The VAE still collapses to conditional means, generating a fraction of the real variance. The diffusion model matches variances far better and reproduces the flat autocorrelation of signed order flow that the real data shows: at every lag from 1 to 5, the generated autocorrelation sits inside the real 95% confidence interval. The VAE invents structure that is not there, with lag 1 at -0.136 and lag 4 at +0.230 against real flow near zero.
+
+The TSTR check is new in this version. A small model predicts near-term flow direction. Trained on diffusion dreams it scores 0.626 on real test windows, matching the majority baseline (0.626); the real-trained model scores 0.591. Nothing beats guessing the majority class, so flow direction is unpredictable at this horizon, and the generator does not invent predictability it should not have. Trained on VAE dreams the same model scores 0.409, worse than the majority baseline. The VAE's invented structure is actively misleading.
 
 ![Discriminator scores, real vs generated](runs/figures/da11d860-69a5-40fb-82f5-ec02c2d4b1cc.png)
 
-Two gaps closed since the first version. The discriminator AUC fell from 0.734 to 0.669: the classifier still separates dreams from reality, but noticeably worse than before. The imbalance mean shift shrank from 0.52 to 0.17 in standardized units. What worked: longer training, EMA sampling weights, a larger denoiser, and two extra hours of recordings from a different time of day. What did not move the needle much on its own: model size without EMA.
+Two gaps closed since the first version. The discriminator AUC is 0.741 on this rerun (0.669 on the previous one): the classifier still separates dreams from reality. The imbalance mean shift shrank from 0.52 to 0.17 in standardized units. What worked: longer training, EMA sampling weights, a larger denoiser, and two extra hours of recordings from a different time of day. What did not move the needle much on its own: model size without EMA.
 
 ## Quickstart
 
@@ -81,16 +84,17 @@ No data and no GPU? Open `docs/dashboard.html` in a browser. It is prebuilt from
 
 - `flowforge/data.py`: parquet to standardized windows, concatenated timeline splits, overlap guard, leakage discipline documented in the docstring.
 - `flowforge/models.py`: conditional VAE baseline and the DDPM (1D conv denoiser, regime conditioning, validated noise schedule, EMA sampling weights).
-- `flowforge/evaluate.py`: Wasserstein distances, autocorrelation, the held out discriminator with fixed seeds, plus a printable report.
+- `flowforge/evaluate.py`: Wasserstein distances, per-window autocorrelation with confidence intervals, the held out discriminator, and a train-on-synthetic-test-on-real check, plus a printable report.
 - `flowforge/demo.py`: loader and plotting helpers for the committed demo bundle, shared by the dashboard and GIF scripts.
 - `examples/demo.py`: end to end training and evaluation. `examples/build_data.py`: rebuild the window dataset. `examples/build_demo.py`: freeze the small `demo/` bundle. `examples/build_dashboard.py`: render `docs/dashboard.html`. `examples/make_gif.py`: render `docs/demo.gif`. `examples/sweep.py`: model config sweep on the validation split. `examples/figures.py`: the real vs dreamed plots.
 - `demo/`: precomputed sample (64 real + 64 generated windows, discriminator scores, metric tables) that ships with the repo so the dashboard works from a fresh clone.
 - `docs/dashboard.html`: the interactive dashboard as one self-contained HTML file. `docs/demo.gif`: the animated preview, rendered from the same bundle.
-- `tests/`: 34 tests. Shapes, NaN handling, no time overlap between splits, EMA roundtrips, every metric checked against synthetic inputs with known answers, and the demo bundle loader.
+- `tests/`: 38 tests. Shapes, NaN handling, no time overlap between splits, EMA roundtrips, every metric checked against synthetic inputs with known answers, and the demo bundle loader.
 
 ## Honest limitations
 
-- The discriminator still wins at 0.669. The dreams are good, not perfect.
+- The discriminator still wins at 0.741. The dreams are good, not perfect.
+- Rerunning the identical seed-7 pipeline moves the discriminator AUC by several points (torch CPU training is not bit-reproducible across runs; I verified the discriminator itself is deterministic on fixed inputs, so the movement is training noise). Small AUC differences are noise; only large gaps mean something.
 - Book sizes are the hardest feature: the generator underplays their variance.
 - Spread is nearly a point mass in this data (BTC spread pinned at one tick), which mostly tests whether the generator reproduces that.
 - Two evenings of BTCUSDT spot: one asset in one mood. Different regimes would give different numbers, and one volatile session would teach the model things this calm data cannot.
