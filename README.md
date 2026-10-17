@@ -34,6 +34,10 @@ Top-of-book quotes and signed trade flow become standardized windows. A regime-c
 | Held-out discriminator AUC | DDPM 0.669; VAE 0.937 |
 | Downstream direction task | DDPM-trained accuracy 0.626, equal to the majority baseline |
 
+## Updating this project
+
+Dashboard source language: **Python**. Generator: `examples/build_dashboard.py`. To keep the interactive page, figures, data animation, and README consistent, follow [the coding-agent update guide](AGENT-DASHBOARD-GUIDE.md). The local interactive output is `docs/dashboard.html`.
+
 ## Run locally
 
 
