@@ -1,17 +1,18 @@
-<p align="center"><img src="docs/readme-banner.svg" alt="FlowForge: Conditional diffusion for market microstructure" width="1200"></p>
+<p align="center"><img src="docs/readme-banner.svg?v=type-20261017b" alt="FlowForge: Conditional diffusion for market microstructure" width="1200"></p>
 
 [![Tests](https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml/badge.svg)](https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-007EC6)](LICENSE) ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB) ![Built with PyTorch + diffusion](https://img.shields.io/badge/built%20with-PyTorch%20%2B%20diffusion-555555) [![Interactive demo](https://img.shields.io/badge/demo-interactive-4C9D39)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
 
-<p align="center"><a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><b>Open interactive demo</b></a> · <a href="docs/dashboard.html">HTML file</a> · <a href="#method">Method</a> · <a href="#run-locally">Run locally</a> · <a href="#limitations">Limitations</a></p>
+<p align="center"><a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><b>Open interactive demo</b></a> · <a href="#method">Method</a> · <a href="#run-locally">Run locally</a></p>
 
 # FlowForge
 
 FlowForge generates short market-state sequences from recorded BTCUSDT data. The central question is whether a model can reproduce observed market behavior, not whether its output merely looks plausible.
 
-**Python · PyTorch · generative time series**
 
-[![FlowForge demo](docs/demo.gif?v=data-20261017)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
+[![FlowForge demo](docs/demo.gif?v=showcase-20261017b)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
 
+
+Useful synthetic market data must preserve more than a plausible price trace. The sequence explorer connects local behavior with distributional distances and temporal dependence, making it easier to spot a generator that matches marginal statistics while missing market dynamics. Real and generated windows are independently sampled and compared by their relative time offsets.
 
 ## Explore
 
