@@ -10,7 +10,7 @@ FlowForge generates short market-state sequences from recorded BTCUSDT data. The
 
 **Python · PyTorch · generative time series**
 
-[![FlowForge demo](docs/demo.gif)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
+[![FlowForge demo](docs/demo.gif?v=data-20261017)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
 
 
 ## Explore
