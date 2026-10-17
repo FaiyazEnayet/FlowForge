@@ -9,3 +9,5 @@ pytest
 plotly
 matplotlib
 pillow
+
+beautifulsoup4>=4.11

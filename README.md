@@ -1,103 +1,81 @@
+<p align="center"><img src="docs/readme-banner.svg" alt="FlowForge: Conditional diffusion for market microstructure" width="1200"></p>
+
+[![Tests](https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml/badge.svg)](https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-007EC6)](LICENSE) ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB) ![Built with PyTorch + diffusion](https://img.shields.io/badge/built%20with-PyTorch%20%2B%20diffusion-555555) [![Interactive demo](https://img.shields.io/badge/demo-interactive-4C9D39)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
+
+<p align="center"><a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><b>Open interactive demo</b></a> · <a href="docs/dashboard.html">HTML file</a> · <a href="#method">Method</a> · <a href="#run-locally">Run locally</a> · <a href="#limitations">Limitations</a></p>
+
 # FlowForge
 
-![tests](https://img.shields.io/badge/tests-38%20passing-brightgreen)
-![license](https://img.shields.io/badge/license-MIT-blue)
-![python](https://img.shields.io/badge/python-3.12-blue)
+FlowForge generates short market-state sequences from recorded BTCUSDT data. The central question is whether a model can reproduce observed market behavior, not whether its output merely looks plausible.
 
-**Teach an AI what a real market looks like, then ask it to dream up new ones.**
+**Python · PyTorch · generative time series**
 
-A limit order book is the waiting list of a market: who wants to buy, who wants to sell, at what price, in what size, updating thousands of times a second. I recorded about four hours of the real one for BTCUSDT, cut it into one minute windows, and trained generative models to produce new windows from scratch. Then I measured, honestly, how close the dreams come to reality.
+[![FlowForge demo](docs/demo.gif)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
 
-This is simulation research. Nothing here trades, connects to a trading endpoint, or touches real money. The point is the generator and the measuring stick, not a strategy.
 
-## Live interactive demo
+## Explore
 
-[![FlowForge dashboard preview](docs/demo.gif?v=2)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
+- Select observed and generated windows independently and inspect them at a synchronized time cursor.
+- Compare midprice, spread and imbalance without presenting synthetic sequences as real observations.
+- Read marginal fidelity, discriminator and temporal diagnostics together.
 
-**[Open the interactive dashboard](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html).** Flip through real vs dreamed market windows, inspect the discriminator scores, and read the full evaluation tables. It is one self-contained HTML file, so it runs anywhere and is ready for GitHub Pages. The animation above is rendered from the same data by `examples/make_gif.py`.
+## Method
 
-## How it works
+Top-of-book quotes and signed trade flow become standardized windows. A regime-conditioned DDPM is evaluated against a conditional VAE using held-out discriminator tests, feature distributions, temporal autocorrelation and downstream prediction.
+
+## Evidence at a glance
+
+| Scope | Recorded result or contract |
+| :--- | :--- |
+| Recorded data | 14,378 seconds across eight sessions |
+| Train / validation / test windows | 937 / 199 / 198 |
+| Mean Wasserstein distance | DDPM 0.276; VAE 0.536 |
+| Held-out discriminator AUC | DDPM 0.669; VAE 0.937 |
+| Downstream direction task | DDPM-trained accuracy 0.626, equal to the majority baseline |
+
+## Run locally
+
+
+```sh
+python -m pip install -r requirements.txt
+python -m pip install -r portfolio_ui/requirements.txt
+python -m pytest tests -q
+python examples/build_dashboard.py
+```
+
+## Technical design
+
+Seven features describe each market-state window: log midprice return, transformed spread, bid and ask size, imbalance, signed flow and trade count. Regime conditioning uses a past lookback rather than the target window. The generator standardizes with training statistics and compares diffusion with a deliberately smaller VAE baseline.
 
 ```mermaid
 flowchart LR
-    A[toxicflow recorder<br/>top of book + trades] --> B[flowforge/data.py<br/>1s bars to 60s windows]
-    B --> C{time split<br/>70/15/15}
-    C --> D[CondVAE baseline<br/>289k params]
-    C --> E[BookDDPM<br/>481k params]
-    D --> F[flowforge/evaluate.py<br/>Wasserstein, ACF, discriminator]
-    E --> F
-    F --> G[examples/demo.py<br/>runs/metrics.json]
-    G --> H[demo/ bundle]
-    H --> I[docs/dashboard.html]
+  N0["Recorded quotes and trades"] --> N1["Market state windows"]
+  N1["Market state windows"] --> N2["Chronological splits"]
+  N2["Chronological splits"] --> N3["DDPM"]
+  N2["Chronological splits"] --> N4["Conditional VAE"]
+  N3["DDPM"] --> N5["Held out diagnostics"]
+  N4["Conditional VAE"] --> N5["Held out diagnostics"]
 ```
 
-**Data.** My toxicflow recorder saves the top of the book (best bid and ask with sizes) ten times a second, plus every trade with its aggressor side. Eight thirty minute sessions gave 14,378 seconds. I turn each second into one state vector: log return of the midprice, spread, log sizes, book imbalance, signed trade volume, trade count. Sixty seconds make one window. Windows are split by position on the concatenated recording timeline, first 70 percent train, next 15 percent validation, last 15 percent test, and a window that straddles a boundary is dropped. The generator never sees validation or test. Standardization uses train statistics only. Sessions recorded hours apart would break a wall-clock split, so concatenation keeps every split populated while staying strictly chronological.
+## Evaluation protocol
 
-**Models.** Two, both conditioned on regime features (recent volatility and spread, computed strictly from the past before each window):
+Windows are assigned chronologically along the concatenated recording timeline. Boundary-straddling windows are dropped, and sessions are not meant to be joined into synthetic continuous market paths. Evaluation asks separate questions about marginal distributions, temporal dependence, distinguishability and downstream utility.
 
-- A conditional VAE baseline, 289k params. Small on purpose. It is the thing to beat.
-- A DDPM diffusion model, 481k params. A 1D conv net learns to remove noise from a window over 100 steps, conditioned on the diffusion timestep and the regime. Sampling uses EMA averaged weights, which proved to be the single biggest quality win. One real bug caught along the way: my first noise schedule never reached pure noise at the last step, so sampling started from the wrong distribution and every generated window came out under dispersed. The code now asserts the schedule actually reaches noise.
+![Marginal fidelity against the VAE baseline](docs/results.png)
 
-**Evaluation.** This is the deliverable. On the held out test split:
+The diffusion result improves on the VAE in mean Wasserstein distance, but a discriminator can still distinguish it from observations. The downstream direction task matches a majority baseline. Distributional fidelity and useful predictive information are different claims.
 
-1. Marginal distributions. For each of the seven features: real vs generated mean, std, and 1-Wasserstein distance.
-2. Temporal structure. Autocorrelation of signed order flow at lags 1 to 5, computed per window and averaged, with 95% confidence intervals. In this sample the real flow is near zero at one second bars, so the check is whether the generator reproduces that flatness instead of inventing structure.
-3. A discriminator test. Train a classifier on validation windows (real vs generated) and report its AUC on test windows the generator never saw. Fixed seeds. AUC near 0.5 means the dreams are indistinguishable.
-4. TSTR: train on synthetic, test on real. A small model learns to predict near-term flow direction from generated windows and is tested on real test windows, next to the same model trained on real windows. This asks whether the dreams are useful, which is a different question from whether they are indistinguishable.
+## Code and data
 
-Every metric was sanity checked on synthetic inputs with known answers first: Wasserstein of identical distributions is ~0 and of N(0,1) vs N(2,1) is ~2, autocorrelation recovers 0.8 on AR(1) data, the discriminator scores ~0.5 on identical distributions and ~1.0 on separated ones. If a check had failed I would have fixed the metric, not the test.
+`flowforge/data.py` owns window construction and split discipline. `models.py` defines the VAE and DDPM. `evaluate.py` owns the evaluation. `demo/` contains the compact recorded result bundle.
 
-## What I found
 
-Real numbers from `examples/demo.py`, seed 7, about 15 minutes of CPU training (timing varies with hardware). Eight thirty minute sessions, 14,378 seconds of book data, 937 train windows, 199 validation, 198 test. The diffusion model: 481k params, 300 epochs, EMA weight averaging for sampling. The VAE baseline is unchanged.
+## Limitations
 
-![Real vs dreamed market windows](runs/figures/93b6b5f7-7be6-49c9-8efc-d4a392e71be5.png)
+- The sample covers a short BTCUSDT recording period and only top-of-book data.
+- Generated windows remain distinguishable from held-out observations. Lower marginal distance does not establish joint realism.
+- Small recording gaps need stricter time-grid validation; see the accompanying portfolio review.
 
-The diffusion model beats the VAE clearly. Mean Wasserstein distance across features: 0.280 vs 0.527. Discriminator AUC on the held out test split: 0.741 vs 0.956. The VAE still collapses to conditional means, generating a fraction of the real variance. The diffusion model matches variances far better and reproduces the flat autocorrelation of signed order flow that the real data shows: at every lag from 1 to 5, the generated autocorrelation sits inside the real 95% confidence interval. The VAE invents structure that is not there, with lag 1 at -0.136 and lag 4 at +0.230 against real flow near zero.
+## License
 
-The TSTR check is new in this version. A small model predicts near-term flow direction. Trained on diffusion dreams it scores 0.626 on real test windows, matching the majority baseline (0.626); the real-trained model scores 0.591. Nothing beats guessing the majority class, so flow direction is unpredictable at this horizon, and the generator does not invent predictability it should not have. Trained on VAE dreams the same model scores 0.409, worse than the majority baseline. The VAE's invented structure is actively misleading.
-
-![Discriminator scores, real vs generated](runs/figures/da11d860-69a5-40fb-82f5-ec02c2d4b1cc.png)
-
-Two gaps closed since the first version. The discriminator AUC is 0.741 on this rerun (0.669 on the previous one): the classifier still separates dreams from reality. The imbalance mean shift shrank from 0.52 to 0.17 in standardized units. What worked: longer training, EMA sampling weights, a larger denoiser, and two extra hours of recordings from a different time of day. What did not move the needle much on its own: model size without EMA.
-
-## Quickstart
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-.venv/bin/pip install -r requirements.txt
-
-# build windows from toxicflow recordings (data/ is gitignored, rebuild it)
-PYTHONPATH=. .venv/bin/python examples/build_data.py ~/workspace/toxicflow/data/chunk1 .../chunk8
-
-# train both models and print the full evaluation
-FF_DDPM_CH=128 FF_DDPM_BLOCKS=4 FF_DDPM_EPOCHS=300 FF_DDPM_EMA=0.999 \
-  PYTHONPATH=. .venv/bin/python examples/demo.py
-
-# tests, including the metric sanity checks
-PYTHONPATH=. .venv/bin/python -m pytest tests/ -q
-```
-
-No data and no GPU? Open `docs/dashboard.html` in a browser. It is prebuilt from a small committed sample under `demo/`, so it works with nothing installed. To rebuild it after a fresh `demo.py` run: `PYTHONPATH=. .venv/bin/python examples/build_demo.py && PYTHONPATH=. .venv/bin/python examples/build_dashboard.py`.
-
-## What is in here
-
-- `flowforge/data.py`: parquet to standardized windows, concatenated timeline splits, overlap guard, leakage discipline documented in the docstring.
-- `flowforge/models.py`: conditional VAE baseline and the DDPM (1D conv denoiser, regime conditioning, validated noise schedule, EMA sampling weights).
-- `flowforge/evaluate.py`: Wasserstein distances, per-window autocorrelation with confidence intervals, the held out discriminator, and a train-on-synthetic-test-on-real check, plus a printable report.
-- `flowforge/demo.py`: loader and plotting helpers for the committed demo bundle, shared by the dashboard and GIF scripts.
-- `examples/demo.py`: end to end training and evaluation. `examples/build_data.py`: rebuild the window dataset. `examples/build_demo.py`: freeze the small `demo/` bundle. `examples/build_dashboard.py`: render `docs/dashboard.html`. `examples/make_gif.py`: render `docs/demo.gif`. `examples/sweep.py`: model config sweep on the validation split. `examples/figures.py`: the real vs dreamed plots.
-- `demo/`: precomputed sample (64 real + 64 generated windows, discriminator scores, metric tables) that ships with the repo so the dashboard works from a fresh clone.
-- `docs/dashboard.html`: the interactive dashboard as one self-contained HTML file. `docs/demo.gif`: the animated preview, rendered from the same bundle.
-- `tests/`: 38 tests. Shapes, NaN handling, no time overlap between splits, EMA roundtrips, every metric checked against synthetic inputs with known answers, and the demo bundle loader.
-
-## Honest limitations
-
-- The discriminator still wins at 0.741. The dreams are good, not perfect.
-- Rerunning the identical seed-7 pipeline moves the discriminator AUC by several points (torch CPU training is not bit-reproducible across runs; I verified the discriminator itself is deterministic on fixed inputs, so the movement is training noise). Small AUC differences are noise; only large gaps mean something.
-- Book sizes are the hardest feature: the generator underplays their variance.
-- Spread is nearly a point mass in this data (BTC spread pinned at one tick), which mostly tests whether the generator reproduces that.
-- Two evenings of BTCUSDT spot: one asset in one mood. Different regimes would give different numbers, and one volatile session would teach the model things this calm data cannot.
-- The recorder saves only the touch, not full depth, so the model learns top of book dynamics only.
-- Small models on CPU, four hours of one asset. This is a proof of concept, not a production simulator.
-- Research code, not trading advice. Nothing here should touch real money.
+[MIT](LICENSE). Third-party datasets, libraries and fonts retain their own terms.
