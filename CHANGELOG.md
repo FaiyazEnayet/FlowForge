@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v1.1.0] - 2026-10-16
 
 ### Fixed
 - Autocorrelation evaluation (`flowforge/evaluate.py`). `flow_acf_table` concatenated signed order flow across overlapping windows (60s windows, 10s stride) before computing autocorrelation. That duplicated most of the data, scrambled temporal order at window junctions, and centered everything on the grand mean. On level-shifted synthetic data the old method reported lag-1 autocorrelation of 0.97 where the true value was 0.3. It now computes autocorrelation per window and averages across windows, with 95% confidence intervals. Added regression tests pinning the per-window behavior and CI coverage.
