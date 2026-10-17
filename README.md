@@ -1,6 +1,6 @@
 # FlowForge
 
-![tests](https://img.shields.io/badge/tests-34%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-38%20passing-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![python](https://img.shields.io/badge/python-3.12-blue)
 
