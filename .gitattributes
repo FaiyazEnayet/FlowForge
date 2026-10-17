@@ -1,0 +1,10 @@
+# Generated dashboard exports do not represent the research source language.
+docs/** linguist-generated=true
+
+# Shared presentation package, copied into this repository as a dependency.
+portfolio_ui/** linguist-vendored=true
+
+# Generated presentation assets embedded by the Go dashboard generator.
+internal/dashboard/portfolio-head.html linguist-generated=true
+internal/dashboard/portfolio-app.js linguist-generated=true
+internal/dashboard/plotly.min.js linguist-vendored=true
