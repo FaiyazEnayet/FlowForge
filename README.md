@@ -36,7 +36,7 @@ Top-of-book quotes and signed trade flow become standardized windows. A regime-c
 
 ## Updating this project
 
-Dashboard source language: **Python**. Generator: `examples/build_dashboard.py`. To keep the interactive page, figures, data animation, and README consistent, follow [the coding-agent update guide](AGENT-DASHBOARD-GUIDE.md). The local interactive output is `docs/dashboard.html`.
+Dashboard source language: **Python**. Generator: `examples/build_dashboard.py`. The local interactive output is `docs/dashboard.html`.
 
 ## Run locally
 
