@@ -79,7 +79,7 @@ The diffusion result improves on the VAE in mean Wasserstein distance, but a dis
 
 - The sample covers a short BTCUSDT recording period and only top-of-book data.
 - Generated windows remain distinguishable from held-out observations. Lower marginal distance does not establish joint realism.
-- Small recording gaps need stricter time-grid validation; see the accompanying portfolio review.
+- Small recording gaps are handled on a strict 1-second grid: a new segment starts at every missing second, the bar after a gap is dropped so no log return ever spans more than one second, and every 60-row window covers exactly 59 seconds of elapsed time.
 
 ## License
 
