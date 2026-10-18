@@ -1,5 +1,9 @@
 # Changelog
 
+## [v1.2.0] - 2026-10-18
+### Fixed
+- Elapsed-time honesty in market windows (`flowforge/data.py`). Seconds without quotes were dropped, gaps up to five seconds were tolerated inside a segment, and windows counted rows: a "60-second" window could span more than 60 seconds, and the first log return after a gap silently covered multiple seconds. The pipeline now follows a documented regular-grid policy: a new segment starts at every missing second, and the bar after a gap is dropped so the 1s log return is only ever defined where the previous second is present. Every accepted 60-row window now spans exactly 59 seconds between endpoints. Added regression tests: a missing-second fixture (cross-gap return dropped, segments split at the gap) and a chunk-boundary return test. Note: the window counts and evaluation metrics recorded in the README were produced under the old policy and should be refreshed on a full rerun.
+
 ## [v1.1.0] - 2026-10-16
 
 ### Fixed

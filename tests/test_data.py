@@ -146,3 +146,66 @@ def test_overlapping_chunks_raise(tmp_path):
     d2 = _synth_chunk(tmp_path, "c2", n_sec=1200, t0_ms=t0 + 600_000, seed=1)
     with pytest.raises(AssertionError):
         build_dataset([d1, d2])
+
+
+def _synth_chunk_with_gap(tmp_path, name, gap_sec, n_sec=900, seed=0,
+                          t0_ms=1_700_000_000_000):
+    """Like _synth_chunk but with no quotes at all during second gap_sec."""
+    d = _synth_chunk(tmp_path, name, n_sec=n_sec, seed=seed, t0_ms=t0_ms)
+    q = pd.read_parquet(f"{d}/quotes.parquet")
+    t0_s = t0_ms // 1000
+    q = q[((q["time"] // 1000) != t0_s + gap_sec)].reset_index(drop=True)
+    q.to_parquet(f"{d}/quotes.parquet")
+    return d
+
+
+def test_missing_second_drops_cross_gap_return(tmp_path):
+    # The bar after a missing second must not carry a multi-second log
+    # return, and segments must split at every gap.
+    from flowforge.data import _bars_from_chunk, _load_chunk, _segments
+    t0 = 1_700_000_000_000
+    d = _synth_chunk_with_gap(tmp_path, "c1", gap_sec=450, t0_ms=t0)
+    q, t = _load_chunk(d)
+    b = _bars_from_chunk(q, t)
+    secs = b.index.to_numpy()
+    # the missing second and the bar after it are both gone
+    assert (t0 // 1000 + 450) not in secs
+    assert (t0 // 1000 + 451) not in secs
+    # every segment is a run of consecutive seconds
+    for seg in _segments(b):
+        s = seg.index.to_numpy()
+        assert np.all(np.diff(s) == 1), "segment must be consecutive seconds"
+
+
+def test_windows_span_exactly_59_seconds(tmp_path):
+    # End to end: with gaps in the data, every accepted 60-row window
+    # still spans exactly 59 seconds between endpoints.
+    from flowforge.data import WINDOW
+    t0 = 1_700_000_000_000
+    d1 = _synth_chunk_with_gap(tmp_path, "c1", gap_sec=200, t0_ms=t0, seed=0)
+    d2 = _synth_chunk_with_gap(tmp_path, "c2", gap_sec=500,
+                               t0_ms=t0 + 1_000_000, seed=1)
+    ds = build_dataset([d1, d2])
+    for split in (ds.train, ds.val, ds.test):
+        assert split.x.shape[1] == WINDOW
+        elapsed = split.t_end - split.t_start
+        assert np.all(elapsed == WINDOW - 1), \
+            f"window spans {elapsed.max()}s, expected {WINDOW - 1}s"
+
+
+def test_chunk_boundary_return_not_shared(tmp_path):
+    # The first bar of a chunk cannot borrow the previous chunk's last
+    # mid for its return: each chunk's bars are built independently.
+    from flowforge.data import _bars_from_chunk, _load_chunk
+    t0 = 1_700_000_000_000
+    d1 = _synth_chunk(tmp_path, "c1", n_sec=300, t0_ms=t0, seed=0)
+    d2 = _synth_chunk(tmp_path, "c2", n_sec=300, t0_ms=t0 + 400_000, seed=1)
+    q1, t1 = _load_chunk(d1)
+    q2, t2 = _load_chunk(d2)
+    b1 = _bars_from_chunk(q1, t1)
+    b2 = _bars_from_chunk(q2, t2)
+    # chunk 2's first kept bar is its second recorded second (first dropped:
+    # no previous second inside the chunk)
+    assert b2.index.min() == t0 // 1000 + 400 + 1
+    # and its return uses only chunk-2 mids
+    assert np.isfinite(b2["log_ret"]).all()

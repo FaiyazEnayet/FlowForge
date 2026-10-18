@@ -26,8 +26,12 @@ Leakage discipline (non-negotiable):
     split only if it lies fully inside that split's range, so no window
     content is ever shared between splits.
   - Windows never cross chunk boundaries (recording gaps/resyncs): seconds
-    are segmented per chunk and a gap longer than MAX_GAP_S starts a new
-    segment. Windows are built inside segments only.
+    are segmented per chunk and a new segment starts at every missing
+    second, so each segment is a run of consecutive seconds. Windows are
+    built inside segments only, which guarantees every 60-row window
+    spans exactly 59 seconds of elapsed time. The 1s log return is only
+    defined where the previous second is present; the bar after a gap is
+    dropped rather than carrying a multi-second return.
   - Regime conditioning features come strictly from a lookback that ends at
     the window start (past only, never the window itself).
 
@@ -58,7 +62,6 @@ N_FEATURES = len(FEATURE_NAMES)
 WINDOW = 60          # seconds per window
 STRIDE = 10          # seconds between window starts
 LOOKBACK = 60        # seconds of past context for regime features
-MAX_GAP_S = 5        # a gap longer than this starts a new segment
 
 TRAIN_FRAC = 0.70
 VAL_FRAC = 0.15
@@ -93,7 +96,13 @@ def _load_chunk(chunk_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _bars_from_chunk(q: pd.DataFrame, t: pd.DataFrame) -> pd.DataFrame:
-    """One row per second. Drops seconds with no quote data (gaps)."""
+    """One row per second, on a regular 1-second grid.
+
+    Seconds with no quote data are missing from the grid (never
+    forward-filled). The 1s log return is only defined where the
+    previous second is present: the bar after a gap is dropped, so no
+    return ever spans more than one second.
+    """
     q = q.copy()
     q["sec"] = (q["time"] // 1000).astype(np.int64)
     # last touch of each second
@@ -112,6 +121,11 @@ def _bars_from_chunk(q: pd.DataFrame, t: pd.DataFrame) -> pd.DataFrame:
     b["trade_count"] = b["trade_count"].fillna(0).astype(np.int64)
 
     b["log_ret"] = np.log(b["mid"] / b["mid"].shift(1))
+    # A return is only a 1-second return when the previous second exists.
+    # The bar after a gap would silently span multiple seconds, so it is
+    # dropped (dropna below) rather than mislabeled.
+    prev_gap = b.index.to_series().diff().ne(1)
+    b.loc[prev_gap, "log_ret"] = np.nan
     b["log_spread_bps"] = np.log1p(b["spread_bps"].clip(lower=0))
     b["log_bid_sz"] = np.log(b["bid_sz"].clip(lower=1e-9))
     b["log_ask_sz"] = np.log(b["ask_sz"].clip(lower=1e-9))
@@ -129,9 +143,14 @@ def _bars_from_chunk(q: pd.DataFrame, t: pd.DataFrame) -> pd.DataFrame:
 
 
 def _segments(b: pd.DataFrame) -> list[pd.DataFrame]:
-    """Split a chunk's bars at gaps longer than MAX_GAP_S seconds."""
+    """Split a chunk's bars at every missing second.
+
+    Regular-grid policy: a segment is a run of consecutive seconds.
+    Windows are built inside segments only, so every accepted 60-row
+    window spans exactly 59 seconds between its endpoints.
+    """
     secs = b.index.to_numpy()
-    cuts = np.where(np.diff(secs) > MAX_GAP_S)[0] + 1
+    cuts = np.where(np.diff(secs) > 1)[0] + 1
     return [b.iloc[s:e] for s, e in zip(np.r_[0, cuts], np.r_[cuts, len(b)])]
 
 
