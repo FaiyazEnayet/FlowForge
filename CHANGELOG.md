@@ -1,5 +1,12 @@
 # Changelog
 
+## [v1.3.0] - 2026-10-18
+### Added
+- Book consistency audit (`flowforge/evaluate.py`). The generator emits log bid size, log ask size, and imbalance as independent features, but physically imbalance must equal (bid_sz - ask_sz) / (bid_sz + ask_sz). `book_consistency_table` measures the violation rate after inverse-transforming to physical units, plus negative implied spread/count checks. `constrain_imbalance` derives the imbalance feature from the generated sizes (constrained decoding). The full evaluation report now includes pre/post consistency tables and the marginal Wasserstein distance before/after the constraint.
+### Tests
+- 4 new regression tests in `tests/test_metrics.py` (violation detection; constraint fix yields zero violations).
+
+
 ## [v1.2.0] - 2026-10-18
 ### Fixed
 - Elapsed-time honesty in market windows (`flowforge/data.py`). Seconds without quotes were dropped, gaps up to five seconds were tolerated inside a segment, and windows counted rows: a "60-second" window could span more than 60 seconds, and the first log return after a gap silently covered multiple seconds. The pipeline now follows a documented regular-grid policy: a new segment starts at every missing second, and the bar after a gap is dropped so the 1s log return is only ever defined where the previous second is present. Every accepted 60-row window now spans exactly 59 seconds between endpoints. Added regression tests: a missing-second fixture (cross-gap return dropped, segments split at the gap) and a chunk-boundary return test. Note: the window counts and evaluation metrics recorded in the README were produced under the old policy and should be refreshed on a full rerun.

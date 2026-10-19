@@ -36,6 +36,88 @@ from .data import FEATURE_NAMES, N_FEATURES, WINDOW
 from .models import set_seed
 
 
+# ------------------------------------------------- book consistency audit
+
+def inverse_transform(gen: np.ndarray, feature_mean: np.ndarray,
+                      feature_std: np.ndarray) -> np.ndarray:
+    """Standardized -> physical units: phys = gen * std + mean."""
+    return gen * feature_std + feature_mean
+
+
+def derive_imbalance(log_bid_sz: np.ndarray,
+                     log_ask_sz: np.ndarray) -> np.ndarray:
+    """Physical imbalance implied by bid/ask sizes.
+
+    imbalance = (bid_sz - ask_sz) / (bid_sz + ask_sz), elementwise.
+    Sizes are reconstructed as exp(log_size).
+    """
+    bid = np.exp(np.asarray(log_bid_sz, dtype=np.float64))
+    ask = np.exp(np.asarray(log_ask_sz, dtype=np.float64))
+    denom = (bid + ask).clip(min=1e-12)
+    return ((bid - ask) / denom).clip(-1.0, 1.0)
+
+
+def book_consistency_table(gen: np.ndarray, feature_mean: np.ndarray,
+                           feature_std: np.ndarray,
+                           tol: float = 0.01) -> dict:
+    """Audit physical constraints on generated book-state windows.
+
+    The generator emits log bid size, log ask size, and imbalance as
+    independent features, but physically imbalance must equal
+    (bid_sz - ask_sz) / (bid_sz + ask_sz). This measures the violation
+    rate after inverse-transforming to physical units, plus sanity checks
+    for negative implied spread and negative implied trade count.
+
+    gen: (n_windows, WINDOW, N_FEATURES) standardized generated windows.
+    Returns violation fractions over all (window, timestep) cells.
+    """
+    phys = inverse_transform(gen, feature_mean, feature_std)
+    j_bid = FEATURE_NAMES.index("log_bid_sz")
+    j_ask = FEATURE_NAMES.index("log_ask_sz")
+    j_imb = FEATURE_NAMES.index("imbalance")
+    j_spr = FEATURE_NAMES.index("log_spread_bps")
+    j_cnt = FEATURE_NAMES.index("log_trade_count")
+
+    implied_imb = derive_imbalance(phys[:, :, j_bid], phys[:, :, j_ask])
+    gen_imb = phys[:, :, j_imb].clip(-1.0, 1.0)
+    imb_err = np.abs(gen_imb - implied_imb)
+    n_cells = imb_err.size
+
+    spread_bps = np.expm1(phys[:, :, j_spr])
+    trade_count = np.expm1(phys[:, :, j_cnt])
+
+    return {
+        "n_cells": int(n_cells),
+        "imbalance_violation_rate": float((imb_err > tol).mean()),
+        "imbalance_mae": float(imb_err.mean()),
+        "imbalance_max_err": float(imb_err.max()),
+        "negative_spread_rate": float((spread_bps < 0).mean()),
+        "negative_count_rate": float((trade_count < -0.5).mean()),
+        "tol": tol,
+    }
+
+
+def constrain_imbalance(gen: np.ndarray, feature_mean: np.ndarray,
+                        feature_std: np.ndarray) -> np.ndarray:
+    """Return a copy of gen with imbalance derived from bid/ask sizes.
+
+    The generator's independent imbalance feature is replaced by the
+    physical value implied by its own log bid/ask sizes, in standardized
+    units. This is constrained decoding: the book is always consistent.
+    """
+    phys = inverse_transform(gen, feature_mean, feature_std)
+    j_bid = FEATURE_NAMES.index("log_bid_sz")
+    j_ask = FEATURE_NAMES.index("log_ask_sz")
+    j_imb = FEATURE_NAMES.index("imbalance")
+    implied = derive_imbalance(phys[:, :, j_bid], phys[:, :, j_ask])
+    # Convert back to standardized units for the imbalance feature.
+    mean_imb = feature_mean[j_imb]
+    std_imb = feature_std[j_imb]
+    fixed = gen.copy()
+    fixed[:, :, j_imb] = (implied - mean_imb) / std_imb
+    return fixed
+
+
 # ------------------------------------------------------------- basic metrics
 
 def wasserstein_1d(a: np.ndarray, b: np.ndarray) -> float:
@@ -276,14 +358,31 @@ def tstr_flow_direction(real_val: np.ndarray, gen_val: np.ndarray,
 
 def full_report(real_test: np.ndarray, gen_test: np.ndarray,
                 real_val: np.ndarray, gen_val: np.ndarray,
-                seed: int = 0) -> dict:
-    return {
+                seed: int = 0,
+                feature_mean: np.ndarray = None,
+                feature_std: np.ndarray = None) -> dict:
+    rep = {
         "marginals": marginal_table(real_test, gen_test),
         "flow_acf": flow_acf_table(real_test, gen_test),
         "discriminator": discriminator_auc(real_val, gen_val, real_test, gen_test,
                                            seed=seed),
         "tstr": tstr_flow_direction(real_val, gen_val, real_test, seed=seed),
     }
+    if feature_mean is not None and feature_std is not None:
+        pre = book_consistency_table(gen_test, feature_mean, feature_std)
+        fixed = constrain_imbalance(gen_test, feature_mean, feature_std)
+        post = book_consistency_table(fixed, feature_mean, feature_std)
+        # downstream fidelity: does the constraint fix move the marginals?
+        pre_w1 = marginal_table(real_test, gen_test)["mean_w1"]
+        post_w1 = marginal_table(real_test, fixed)["mean_w1"]
+        rep["book_consistency"] = {
+            "pre": pre,
+            "post": post,
+            "constrained": True,
+            "marginal_w1_pre": pre_w1,
+            "marginal_w1_post": post_w1,
+        }
+    return rep
 
 
 def print_report(rep: dict) -> None:

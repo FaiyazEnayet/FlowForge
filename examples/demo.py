@@ -76,12 +76,14 @@ def main():
 
     print("\n########## VAE baseline ##########")
     rep_vae = full_report(ds.test.x, gen_test_vae, ds.val.x, gen_val_vae,
-                          seed=SEED)
+                          seed=SEED, feature_mean=ds.feature_mean,
+                          feature_std=ds.feature_std)
     print_report(rep_vae)
 
     print("\n########## DDPM ##########")
     rep_ddpm = full_report(ds.test.x, gen_test_ddpm, ds.val.x, gen_val_ddpm,
-                           seed=SEED)
+                           seed=SEED, feature_mean=ds.feature_mean,
+                           feature_std=ds.feature_std)
     print_report(rep_ddpm)
 
     os.makedirs(RUNS, exist_ok=True)
