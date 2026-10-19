@@ -209,3 +209,84 @@ def test_chunk_boundary_return_not_shared(tmp_path):
     assert b2.index.min() == t0 // 1000 + 400 + 1
     # and its return uses only chunk-2 mids
     assert np.isfinite(b2["log_ret"]).all()
+
+
+def test_session_disjoint_no_shared_sessions(tmp_path):
+    # FL3: whole sessions go to one split; no session id appears in two
+    # splits. Four synthetic chunks -> default 70/15/15 by chunk count.
+    dirs = [_synth_chunk(tmp_path, f"c{i}", n_sec=900,
+                         t0_ms=1_700_000_000_000 + i * 2_000_000, seed=i)
+            for i in range(4)]
+    ds = build_dataset(dirs)
+    seen = {}
+    for name in ("train", "val", "test"):
+        for sid in np.unique(getattr(ds, name).session_ids).tolist():
+            assert sid not in seen, f"session {sid} in two splits"
+            seen[sid] = name
+    assert len(seen) == 4
+    # session_ids are valid chunk indices
+    for name in ("train", "val", "test"):
+        sids = getattr(ds, name).session_ids
+        assert ((sids >= 0) & (sids < 4)).all()
+
+
+def test_explicit_session_manifest_respected(tmp_path):
+    # An explicit manifest locks test session identities before sweeps.
+    dirs = [_synth_chunk(tmp_path, f"c{i}", n_sec=900,
+                         t0_ms=1_700_000_000_000 + i * 2_000_000, seed=i)
+            for i in range(4)]
+    ds = build_dataset(dirs, session_split={"train": [0, 1],
+                                            "val": [2], "test": [3]})
+    assert set(np.unique(ds.train.session_ids).tolist()) == {0, 1}
+    assert set(np.unique(ds.val.session_ids).tolist()) == {2}
+    assert set(np.unique(ds.test.session_ids).tolist()) == {3}
+    assert ds.session_split == {"train": [0, 1], "val": [2], "test": [3]}
+
+
+def test_session_manifest_must_cover_each_chunk_once(tmp_path):
+    import pytest
+    dirs = [_synth_chunk(tmp_path, f"c{i}", n_sec=900,
+                         t0_ms=1_700_000_000_000 + i * 2_000_000, seed=i)
+            for i in range(3)]
+    with pytest.raises(ValueError):
+        build_dataset(dirs, session_split={"train": [0, 1],
+                                           "val": [2], "test": [2]})
+    with pytest.raises(ValueError):
+        build_dataset(dirs, session_split={"train": [0], "val": [1],
+                                           "test": []})
+
+
+def test_write_manifest_and_dataset_card(tmp_path):
+    import json
+    from flowforge.data import dataset_card, write_manifest
+    dirs = [_synth_chunk(tmp_path, f"c{i}", n_sec=900,
+                         t0_ms=1_700_000_000_000 + i * 2_000_000, seed=i)
+            for i in range(4)]
+    ds = build_dataset(dirs)
+    mp = tmp_path / "manifest.json"
+    manifest = write_manifest(ds, str(mp))
+    assert mp.exists()
+    assert manifest["n_chunks"] == 4
+    assert len(manifest["chunks"]) == 4
+    assert all(len(c["sha16"]) == 16 for c in manifest["chunks"])
+    card = dataset_card(ds)
+    assert "session-disjoint" in card.lower() or "Session-disjoint" in card
+    assert "BTCUSDT" in card
+    for s in ("train", "val", "test"):
+        assert s in card
+
+
+def test_save_load_roundtrip_preserves_sessions(tmp_path):
+    dirs = [_synth_chunk(tmp_path, f"c{i}", n_sec=900,
+                         t0_ms=1_700_000_000_000 + i * 2_000_000, seed=i)
+            for i in range(4)]
+    ds = build_dataset(dirs)
+    p = tmp_path / "ds.npz"
+    save_dataset(ds, str(p))
+    ds2 = load_dataset(str(p))
+    for name in ("train", "val", "test"):
+        a = getattr(ds, name).session_ids
+        b = getattr(ds2, name).session_ids
+        assert np.array_equal(a, b), name
+    assert ds2.session_split == ds.session_split
+    assert ds2.chunk_hashes == ds.chunk_hashes
