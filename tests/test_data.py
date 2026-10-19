@@ -35,10 +35,16 @@ def _synth_chunk(tmp_path, name, n_sec=900, seed=0, t0_ms=1_700_000_000_000):
     return str(d)
 
 
+def _three_chunks(tmp_path, n_sec=900, gap_ms=2_000_000, seed0=0):
+    # Three sessions is the minimum for session-disjoint train/val/test.
+    return [_synth_chunk(tmp_path, f"c{i}", n_sec=n_sec,
+                         t0_ms=1_700_000_000_000 + i * gap_ms, seed=seed0 + i)
+            for i in range(3)]
+
+
 def test_build_shapes_and_no_nan(tmp_path):
-    d1 = _synth_chunk(tmp_path, "c1", t0_ms=1_700_000_000_000)
-    d2 = _synth_chunk(tmp_path, "c2", t0_ms=1_700_000_000_000 + 1_000_000, seed=1)
-    ds = build_dataset([d1, d2])
+    dirs = _three_chunks(tmp_path)
+    ds = build_dataset(dirs)
     for split in (ds.train, ds.val, ds.test):
         assert split.x.ndim == 3
         assert split.x.shape[1] == WINDOW
@@ -46,15 +52,13 @@ def test_build_shapes_and_no_nan(tmp_path):
         assert split.regime.shape == (split.x.shape[0], 2)
         assert np.isfinite(split.x).all()
         assert np.isfinite(split.regime).all()
-    assert ds.n_chunks == 2
+    assert ds.n_chunks == 3
     assert ds.n_seconds > 0
 
 
 def test_no_time_overlap_between_splits(tmp_path):
-    d1 = _synth_chunk(tmp_path, "c1", n_sec=900, t0_ms=1_700_000_000_000)
-    d2 = _synth_chunk(tmp_path, "c2", n_sec=900,
-                      t0_ms=1_700_000_000_000 + 2_000_000, seed=1)
-    ds = build_dataset([d1, d2])
+    dirs = _three_chunks(tmp_path)
+    ds = build_dataset(dirs)
     # every train window ends before every val window starts, etc.
     assert ds.train.t_end.max() <= ds.val.t_start.min()
     assert ds.val.t_end.max() <= ds.test.t_start.min()
@@ -64,8 +68,8 @@ def test_no_time_overlap_between_splits(tmp_path):
 
 
 def test_standardization_uses_train_only(tmp_path):
-    d1 = _synth_chunk(tmp_path, "c1", n_sec=900, t0_ms=1_700_000_000_000)
-    ds = build_dataset([d1])
+    dirs = _three_chunks(tmp_path)
+    ds = build_dataset(dirs)
     pooled = ds.train.x.reshape(-1, N_FEATURES)
     # train split standardized to ~zero mean unit variance by construction
     assert np.abs(pooled.mean(axis=0)).max() < 0.05
@@ -73,38 +77,49 @@ def test_standardization_uses_train_only(tmp_path):
 
 
 def test_save_load_roundtrip(tmp_path):
-    d1 = _synth_chunk(tmp_path, "c1", t0_ms=1_700_000_000_000)
-    ds = build_dataset([d1])
+    dirs = _three_chunks(tmp_path)
+    ds = build_dataset(dirs)
     p = str(tmp_path / "ds.npz")
     save_dataset(ds, p)
     ds2 = load_dataset(p)
     assert np.array_equal(ds.train.x, ds2.train.x)
     assert np.array_equal(ds.test.regime, ds2.test.regime)
     assert ds2.n_chunks == ds.n_chunks
+    assert np.array_equal(ds.train.session_ids, ds2.train.session_ids)
+    assert ds2.chunk_dirs == ds.chunk_dirs
+    assert ds2.chunk_hashes == ds.chunk_hashes
+    assert ds2.chunk_symbols == ds.chunk_symbols
+    assert ds2.chunk_stats == ds.chunk_stats
+    assert ds2.session_split == ds.session_split
 
 
 def test_regime_uses_strictly_past_data(tmp_path):
     # Regression test: regime features for a window must not move when data
     # at or after the window start changes. The lookback ends at the window
     # start, so perturbing quotes from one window start onward must leave
-    # that window's regime untouched.
+    # that window's regime untouched. The perturbed chunk is the test
+    # session (default split with 3 sessions: train/val/test = c1/c2/c3).
     t0 = 1_700_000_000_000
-    d1 = _synth_chunk(tmp_path, "c1", n_sec=1200, t0_ms=t0, seed=0)
-    ds = build_dataset([d1])
+    c1 = _synth_chunk(tmp_path, "c1", n_sec=1200, t0_ms=t0, seed=0)
+    c2 = _synth_chunk(tmp_path, "c2", n_sec=1200, t0_ms=t0 + 2_000_000, seed=1)
+    c3a = _synth_chunk(tmp_path, "c3a", n_sec=1200, t0_ms=t0 + 4_000_000, seed=2)
+    ds = build_dataset([c1, c2, c3a])
+    assert set(np.unique(ds.test.session_ids).tolist()) == {2}
 
     # cut lands exactly on a window start: bars drop the first second, so
-    # window starts sit at t0 + 1 + {60, 70, ...}; 1090 is one of them.
-    cut_sec = t0 // 1000 + 1 + 1090
+    # window starts sit at t3 + 1 + {60, 70, ...}; 1090 is one of them.
+    t3 = t0 + 4_000_000
+    cut_sec = t3 // 1000 + 1 + 1090
     cut_ms = cut_sec * 1000
-    d2 = tmp_path / "c2"
-    d2.mkdir()
-    q = pd.read_parquet(f"{d1}/quotes.parquet")
+    c3b = tmp_path / "c3b"
+    c3b.mkdir()
+    q = pd.read_parquet(f"{c3a}/quotes.parquet")
     after = q["time"] >= cut_ms
     q.loc[after, "bid_px"] *= 1.5
     q.loc[after, "ask_px"] *= 1.5
-    q.to_parquet(d2 / "quotes.parquet")
-    shutil.copy(tmp_path / "c1" / "trades.parquet", d2 / "trades.parquet")
-    ds2 = build_dataset([str(d2)])
+    q.to_parquet(c3b / "quotes.parquet")
+    shutil.copy(tmp_path / "c3a" / "trades.parquet", c3b / "trades.parquet")
+    ds2 = build_dataset([c1, c2, str(c3b)])
 
     assert np.array_equal(ds.test.t_start, ds2.test.t_start)
     idx = int(np.where(ds.test.t_start == cut_sec)[0][0])
@@ -116,8 +131,8 @@ def test_regime_uses_strictly_past_data(tmp_path):
 
 def test_large_gap_between_chunks_keeps_splits_populated(tmp_path):
     # Regression test: chunks recorded hours apart must not leave a split
-    # empty. The split runs on the concatenated recording timeline, so the
-    # later session lands in test (different time of day by design).
+    # empty. Splits are session-disjoint, so with three sessions the late
+    # one becomes the test split by construction.
     t0 = 1_700_000_000_000
     d1 = _synth_chunk(tmp_path, "c1", n_sec=1200, t0_ms=t0, seed=0)
     d2 = _synth_chunk(tmp_path, "c2", n_sec=1200, t0_ms=t0 + 1_300_000, seed=1)
@@ -126,11 +141,11 @@ def test_large_gap_between_chunks_keeps_splits_populated(tmp_path):
                       t0_ms=t0 + 4 * 3600_000 + 1_300_000, seed=2)
     ds = build_dataset([d1, d2, d3])
     assert len(ds.train.x) > 0 and len(ds.val.x) > 0 and len(ds.test.x) > 0
-    # the late session (4h later) lands in val/test, not train: with 3600s
-    # total, the 85% cut sits 660s into chunk 3, so all test windows start
-    # after the 4h gap
+    # the late session (4h later) is the whole test split: every test
+    # window starts after the 4h gap
+    assert set(np.unique(ds.test.session_ids).tolist()) == {2}
     assert ds.test.t_start.min() >= t0 / 1000 + 4 * 3600
-    # concatenated order is chronological, so splits stay time-ordered
+    # sessions are chronological, so splits stay time-ordered
     assert ds.train.t_end.max() <= ds.val.t_start.min()
     assert ds.val.t_end.max() <= ds.test.t_start.min()
     all_starts = np.concatenate([ds.train.t_start, ds.val.t_start, ds.test.t_start])
@@ -184,8 +199,10 @@ def test_windows_span_exactly_59_seconds(tmp_path):
     t0 = 1_700_000_000_000
     d1 = _synth_chunk_with_gap(tmp_path, "c1", gap_sec=200, t0_ms=t0, seed=0)
     d2 = _synth_chunk_with_gap(tmp_path, "c2", gap_sec=500,
-                               t0_ms=t0 + 1_000_000, seed=1)
-    ds = build_dataset([d1, d2])
+                               t0_ms=t0 + 2_000_000, seed=1)
+    d3 = _synth_chunk_with_gap(tmp_path, "c3", gap_sec=300,
+                               t0_ms=t0 + 4_000_000, seed=2)
+    ds = build_dataset([d1, d2, d3])
     for split in (ds.train, ds.val, ds.test):
         assert split.x.shape[1] == WINDOW
         elapsed = split.t_end - split.t_start
@@ -262,18 +279,51 @@ def test_write_manifest_and_dataset_card(tmp_path):
     dirs = [_synth_chunk(tmp_path, f"c{i}", n_sec=900,
                          t0_ms=1_700_000_000_000 + i * 2_000_000, seed=i)
             for i in range(4)]
+    for d in dirs:
+        with open(f"{d}/meta.json", "w") as f:
+            json.dump({"symbol": "BTCUSDT"}, f)
     ds = build_dataset(dirs)
+    assert ds.chunk_symbols == ["BTCUSDT"] * 4
     mp = tmp_path / "manifest.json"
     manifest = write_manifest(ds, str(mp))
     assert mp.exists()
     assert manifest["n_chunks"] == 4
     assert len(manifest["chunks"]) == 4
     assert all(len(c["sha16"]) == 16 for c in manifest["chunks"])
+    assert all(c["symbol"] == "BTCUSDT" for c in manifest["chunks"])
+    assert all("seconds_missing" in c for c in manifest["chunks"])
     card = dataset_card(ds)
     assert "session-disjoint" in card.lower() or "Session-disjoint" in card
     assert "BTCUSDT" in card
+    assert "Missingness" in card
     for s in ("train", "val", "test"):
         assert s in card
+
+
+def test_fewer_than_three_sessions_raises(tmp_path):
+    # Session-disjoint train/val/test needs at least three sessions; the
+    # error must say so plainly instead of emitting an empty split.
+    import pytest
+    d1 = _synth_chunk(tmp_path, "c1", t0_ms=1_700_000_000_000)
+    d2 = _synth_chunk(tmp_path, "c2", t0_ms=1_700_000_000_000 + 2_000_000,
+                      seed=1)
+    with pytest.raises(ValueError, match="at least 3 sessions"):
+        build_dataset([d1])
+    with pytest.raises(ValueError, match="at least 3 sessions"):
+        build_dataset([d1, d2])
+
+
+def test_skipped_empty_chunk_keeps_hashes_aligned(tmp_path):
+    # A chunk with no usable bars is skipped; the surviving chunk dirs,
+    # hashes, symbols and stats must stay aligned with each other.
+    empty = _synth_chunk(tmp_path, "empty", n_sec=1, seed=9)
+    dirs = _three_chunks(tmp_path)
+    ds = build_dataset([empty] + dirs)
+    assert ds.n_chunks == 3
+    assert ds.chunk_dirs == dirs
+    assert len(set(ds.chunk_hashes)) == 3
+    assert ds.chunk_symbols == ["unknown"] * 3
+    assert all(s["usable"] > 0 for s in ds.chunk_stats)
 
 
 def test_save_load_roundtrip_preserves_sessions(tmp_path):

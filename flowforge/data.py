@@ -18,13 +18,13 @@ book-state vector built from 1s bars of quotes plus signed trade flow:
 
 Leakage discipline (non-negotiable):
   - Bars are standardized with mean/std fit on the TRAIN split only.
-  - Windows are assigned to train/val/test by their position on the
-    concatenated recording timeline (chunks in chronological order, first
-    70% train, next 15% val, last 15% test). Absolute-clock splits break
-    when sessions are hours apart, so concatenation keeps every split
-    populated while staying strictly chronological. A window belongs to a
-    split only if it lies fully inside that split's range, so no window
-    content is ever shared between splits.
+  - Splits are session-disjoint: whole recording sessions (chunks) are
+    assigned to train, val, or test, never split across them. By default
+    the first 70% of sessions (chronological) go to train, the next 15%
+    to val, and the remainder to test; an explicit session_split manifest
+    locks the assignment before any sweep. No raw second ever appears in
+    two splits by construction, so no window content is ever shared
+    between splits.
   - Windows never cross chunk boundaries (recording gaps/resyncs): seconds
     are segmented per chunk and a new segment starts at every missing
     second, so each segment is a run of consecutive seconds. Windows are
@@ -43,6 +43,7 @@ Standardized with train statistics.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -90,6 +91,8 @@ class BookDataset:
     n_chunks: int = 0
     chunk_dirs: list = field(default_factory=list, repr=False)
     chunk_hashes: list = field(default_factory=list, repr=False)
+    chunk_symbols: list = field(default_factory=list, repr=False)
+    chunk_stats: list = field(default_factory=list, repr=False)
     session_split: dict = field(default_factory=dict, repr=False)
 
 
@@ -97,6 +100,15 @@ def _load_chunk(chunk_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     q = pd.read_parquet(f"{chunk_dir}/quotes.parquet")
     t = pd.read_parquet(f"{chunk_dir}/trades.parquet")
     return q, t
+
+
+def _chunk_symbol(chunk_dir: str) -> str:
+    """Recording symbol from the chunk's meta.json, if present."""
+    try:
+        with open(os.path.join(chunk_dir, "meta.json")) as f:
+            return str(json.load(f).get("symbol", "unknown"))
+    except (OSError, ValueError):
+        return "unknown"
 
 
 def _bars_from_chunk(q: pd.DataFrame, t: pd.DataFrame) -> pd.DataFrame:
@@ -181,39 +193,57 @@ def build_dataset(chunk_dirs: list[str],
     order. No raw second ever appears in two splits by construction.
     """
     import hashlib
-    all_bars = []
-    chunk_hashes = []
+    # Parallel kept-lists: a chunk with no usable bars is skipped, and the
+    # surviving entries stay aligned (dir <-> bars <-> hash <-> symbol).
+    kept_dirs: list[str] = []
+    kept_bars = []
+    kept_hashes: list[str] = []
+    kept_symbols: list[str] = []
+    kept_stats: list[dict] = []
     for d in chunk_dirs:
         q, t = _load_chunk(d)
         # hash the raw inputs for the manifest
         h = hashlib.sha256()
         h.update(q.to_numpy().tobytes())
         h.update(t.to_numpy().tobytes())
-        chunk_hashes.append(h.hexdigest()[:16])
         b = _bars_from_chunk(q, t)
-        if len(b) > 0:
-            all_bars.append(b)
-    if not all_bars:
+        if len(b) == 0:
+            continue
+        span = int(b.index.max() - b.index.min()) + 1
+        kept_dirs.append(d)
+        kept_bars.append(b)
+        kept_hashes.append(h.hexdigest()[:16])
+        kept_symbols.append(_chunk_symbol(d))
+        kept_stats.append({"span": span, "usable": int(len(b)),
+                           "missing": span - int(len(b))})
+    if not kept_bars:
         raise ValueError("no usable bars in any chunk")
-    n_seconds = int(sum(len(b) for b in all_bars))
+    n_seconds = int(sum(len(b) for b in kept_bars))
 
     # Sort chunks chronologically; guard against overlapping sessions.
-    order = sorted(range(len(all_bars)),
-                   key=lambda i: all_bars[i].index.min())
-    ordered = [all_bars[i] for i in order]
-    ordered_dirs = [chunk_dirs[i] for i in order]
-    ordered_hashes = [chunk_hashes[i] for i in order]
+    order = sorted(range(len(kept_bars)),
+                   key=lambda i: kept_bars[i].index.min())
+    ordered = [kept_bars[i] for i in order]
+    ordered_dirs = [kept_dirs[i] for i in order]
+    ordered_hashes = [kept_hashes[i] for i in order]
+    ordered_symbols = [kept_symbols[i] for i in order]
+    ordered_stats = [kept_stats[i] for i in order]
     for prev, cur in zip(ordered[:-1], ordered[1:]):
         assert cur.index.min() > prev.index.max(), \
             "chunk time ranges overlap; sort/deduplicate recording sessions"
 
     n = len(ordered)
     if session_split is None:
-        # Default: chronological 70/15/15 by chunk count.
-        n_train = max(1, int(round(n * TRAIN_FRAC)))
+        # Default: chronological 70/15/15 by chunk count, whole sessions.
+        # Fewer than three sessions cannot populate three disjoint splits.
+        if n < 3:
+            raise ValueError(
+                f"need at least 3 sessions for session-disjoint "
+                f"train/val/test splits, got {n}; pass an explicit "
+                f"session_split or add sessions")
+        n_test = max(1, int(round(n * (1.0 - TRAIN_FRAC - VAL_FRAC))))
         n_val = max(1, int(round(n * VAL_FRAC)))
-        if n_train + n_val >= n:
-            n_val = max(1, n - n_train - 1)
+        n_train = n - n_test - n_val
         session_split = {
             "train": list(range(n_train)),
             "val": list(range(n_train, n_train + n_val)),
@@ -287,8 +317,9 @@ def build_dataset(chunk_dirs: list[str],
         train=pack("train"), val=pack("val"), test=pack("test"),
         feature_mean=f_mean, feature_std=f_std,
         regime_mean=r_mean, regime_std=r_std,
-        n_seconds=n_seconds, n_chunks=len(all_bars),
+        n_seconds=n_seconds, n_chunks=len(ordered),
         chunk_dirs=ordered_dirs, chunk_hashes=ordered_hashes,
+        chunk_symbols=ordered_symbols, chunk_stats=ordered_stats,
         session_split={k: list(v) for k, v in session_split.items()},
     )
 
@@ -306,9 +337,12 @@ def write_manifest(ds: BookDataset, path: str) -> None:
         "n_chunks": ds.n_chunks,
         "n_seconds": ds.n_seconds,
         "chunks": [
-            {"session_id": i, "dir": d, "sha16": h,
-             "split": next(s for s, idxs in ds.session_split.items() if i in idxs)}
-            for i, (d, h) in enumerate(zip(ds.chunk_dirs, ds.chunk_hashes))
+            {"session_id": i, "dir": d, "symbol": sym, "sha16": h,
+             "split": next(s for s, idxs in ds.session_split.items() if i in idxs),
+             "seconds_span": st["span"], "seconds_usable": st["usable"],
+             "seconds_missing": st["missing"]}
+            for i, (d, h, sym, st) in enumerate(zip(
+                ds.chunk_dirs, ds.chunk_hashes, ds.chunk_symbols, ds.chunk_stats))
         ],
         "session_split": ds.session_split,
         "windows": {s: int(getattr(ds, s).x.shape[0])
@@ -331,7 +365,14 @@ def dataset_card(ds: BookDataset) -> str:
     lines.append(f"- Sessions (chunks): {ds.n_chunks}")
     lines.append(f"- Total seconds of book data: {ds.n_seconds} "
                  f"({ds.n_seconds / 3600:.2f} hours)")
-    lines.append(f"- Symbol: BTCUSDT (single-symbol recordings)")
+    symbols = sorted(set(ds.chunk_symbols)) if ds.chunk_symbols else ["unknown"]
+    lines.append(f"- Symbols: {', '.join(symbols)}")
+    if ds.chunk_stats:
+        total_span = sum(s["span"] for s in ds.chunk_stats)
+        total_missing = sum(s["missing"] for s in ds.chunk_stats)
+        lines.append(f"- Missingness: {total_missing} of {total_span} "
+                     f"session-seconds have no usable bar (recording gaps; "
+                     f"the bar after a gap is dropped)")
     lines.append("")
     lines.append("## Split manifest (session-disjoint)")
     lines.append("")
@@ -344,11 +385,15 @@ def dataset_card(ds: BookDataset) -> str:
     lines.append("")
     lines.append("## Sessions")
     lines.append("")
-    lines.append("| ID | Directory | SHA16 | Split |")
-    lines.append("|----|-----------|-------|-------|")
-    for i, (d, h) in enumerate(zip(ds.chunk_dirs, ds.chunk_hashes)):
+    lines.append("| ID | Directory | Symbol | SHA16 | Split | Span (s) | "
+                 "Usable (s) | Missing (s) |")
+    lines.append("|----|-----------|--------|-------|-------|----------|"
+                 "------------|-------------|")
+    for i, (d, sym, h, st) in enumerate(zip(
+            ds.chunk_dirs, ds.chunk_symbols, ds.chunk_hashes, ds.chunk_stats)):
         split = next(s for s, idxs in ds.session_split.items() if i in idxs)
-        lines.append(f"| {i} | {d} | {h} | {split} |")
+        lines.append(f"| {i} | {d} | {sym} | {h} | {split} | {st['span']} | "
+                     f"{st['usable']} | {st['missing']} |")
     lines.append("")
     lines.append("## Notes")
     lines.append("- Windows never cross chunk boundaries; every 60-row window "
@@ -371,6 +416,8 @@ def save_dataset(ds: BookDataset, path: str) -> None:
         n_seconds=np.array(ds.n_seconds), n_chunks=np.array(ds.n_chunks),
         chunk_dirs=np.array(ds.chunk_dirs, dtype=object),
         chunk_hashes=np.array(ds.chunk_hashes, dtype=object),
+        chunk_symbols=np.array(ds.chunk_symbols, dtype=object),
+        chunk_stats_json=np.array(json.dumps(ds.chunk_stats)),
         session_split_json=np.array(json.dumps(ds.session_split)),
     )
 
@@ -393,6 +440,7 @@ def load_dataset(path: str) -> BookDataset:
         return [str(x) for x in z[key].tolist()] if key in z else []
 
     split = json.loads(str(z["session_split_json"])) if "session_split_json" in z else {}
+    stats = json.loads(str(z["chunk_stats_json"])) if "chunk_stats_json" in z else []
     return BookDataset(
         train=unpack("train"), val=unpack("val"), test=unpack("test"),
         feature_mean=z["feature_mean"], feature_std=z["feature_std"],
@@ -400,5 +448,7 @@ def load_dataset(path: str) -> BookDataset:
         n_seconds=int(z["n_seconds"]), n_chunks=int(z["n_chunks"]),
         chunk_dirs=_str_list("chunk_dirs"),
         chunk_hashes=_str_list("chunk_hashes"),
+        chunk_symbols=_str_list("chunk_symbols"),
+        chunk_stats=stats,
         session_split=split,
     )
