@@ -191,8 +191,49 @@ def marginal_table(real: np.ndarray, gen: np.ndarray) -> dict:
             "mean_w1": float(np.mean([r["w1"] for r in rows]))}
 
 
+def _block_bootstrap_ci(x: np.ndarray, block_len: int = 10,
+                        n_boot: int = 2000, alpha: float = 0.05,
+                        seed: int = 0) -> list[float]:
+    """Block bootstrap confidence interval for the mean.
+
+    FL6: windows overlap (stride 10 < window 60), so per-window statistics
+    are not independent. The normal approximation with n = window count
+    understates uncertainty. The moving block bootstrap resamples blocks
+    of consecutive windows, preserving short-range dependence.
+
+    x must be in chronological window order. block_len is the tuning
+    parameter: too short under-covers, too long adds noise. Report
+    sensitivity to it. Returns [lower, upper] for the (1-alpha) interval.
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    x = x[np.isfinite(x)]
+    n = len(x)
+    if n < 2:
+        return [float("nan"), float("nan")]
+    if block_len < 1:
+        block_len = 1
+    if block_len > n:
+        block_len = n
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block_len))
+    boot_means = np.empty(n_boot)
+    for b in range(n_boot):
+        idx = rng.integers(0, n - block_len + 1, size=n_blocks)
+        sample = np.concatenate([x[i:i + block_len] for i in idx])[:n]
+        boot_means[b] = sample.mean()
+    lo = float(np.quantile(boot_means, alpha / 2))
+    hi = float(np.quantile(boot_means, 1 - alpha / 2))
+    return [lo, hi]
+
+
 def _mean_ci(x: np.ndarray, z: float = 1.96) -> list[float]:
-    """95% confidence interval for the mean (normal approximation)."""
+    """95% confidence interval for the mean (normal approximation).
+
+    DEPRECATED for window-averaged statistics: windows overlap, so the
+    effective sample size is smaller than the window count. Use
+    _block_bootstrap_ci for those. Kept for backward compatibility and
+    for genuinely independent samples.
+    """
     x = np.asarray(x, dtype=np.float64).ravel()
     x = x[np.isfinite(x)]
     if len(x) < 2:
@@ -203,14 +244,16 @@ def _mean_ci(x: np.ndarray, z: float = 1.96) -> list[float]:
 
 
 def flow_acf_table(real: np.ndarray, gen: np.ndarray,
-                   lags: tuple[int, ...] = (1, 2, 3, 4, 5)) -> dict:
+                   lags: tuple[int, ...] = (1, 2, 3, 4, 5),
+                   block_len: int = 10) -> dict:
     """Mean autocorrelation of signed order flow, averaged across windows.
 
     Each window is a genuine continuous series, so the autocorrelation is
-    computed per window and averaged. Concatenating overlapping windows
-    instead would duplicate most of the data and scramble temporal order at
-    the junctions. Windows overlap (stride < window length), so the
-    confidence intervals are approximate.
+    computed per window and averaged. Windows overlap (stride 10 < window
+    60), so per-window ACFs are dependent: confidence intervals use the
+    moving block bootstrap (FL6), not the normal approximation. The
+    bootstrap unit is the window index in chronological order; block_len
+    is disclosed and sensitivity should be checked.
     """
     j = FEATURE_NAMES.index("signed_flow")
     rows = []
@@ -222,11 +265,12 @@ def flow_acf_table(real: np.ndarray, gen: np.ndarray,
         rows.append({
             "lag": lag,
             "real_acf": float(r.mean()) if len(r) else float("nan"),
-            "real_ci": _mean_ci(r),
+            "real_ci": _block_bootstrap_ci(r, block_len=block_len),
             "gen_acf": float(g.mean()) if len(g) else float("nan"),
-            "gen_ci": _mean_ci(g),
+            "gen_ci": _block_bootstrap_ci(g, block_len=block_len),
             "n_real": int(len(r)),
             "n_gen": int(len(g)),
+            "ci_method": f"block_bootstrap_block{block_len}",
         })
     return {"rows": rows}
 

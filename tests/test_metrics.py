@@ -198,3 +198,56 @@ def test_constrain_imbalance_fixes_violation():
     rep = book_consistency_table(fixed, f_mean, f_std)
     assert rep["imbalance_violation_rate"] == 0.0
     assert rep["imbalance_mae"] == 0.0
+
+
+def test_block_bootstrap_ci_covers_true_mean_iid():
+    from flowforge.evaluate import _block_bootstrap_ci
+    rng = np.random.default_rng(100)
+    covers = 0
+    trials = 40
+    for t in range(trials):
+        x = rng.normal(5.0, 2.0, size=500)
+        lo, hi = _block_bootstrap_ci(x, block_len=1, n_boot=500, seed=t)
+        if lo <= 5.0 <= hi:
+            covers += 1
+    assert covers >= 30, f"coverage {covers}/{trials}"
+
+
+def test_block_bootstrap_wider_than_naive_under_dependence():
+    from flowforge.evaluate import _block_bootstrap_ci, _mean_ci
+    rng = np.random.default_rng(101)
+    e = rng.normal(size=2000)
+    x = np.zeros_like(e)
+    for i in range(1, len(e)):
+        x[i] = 0.8 * x[i - 1] + e[i]
+    naive = _mean_ci(x)
+    boot = _block_bootstrap_ci(x, block_len=20, n_boot=1000, seed=0)
+    naive_w = naive[1] - naive[0]
+    boot_w = boot[1] - boot[0]
+    assert boot_w > naive_w, f"boot {boot_w:.4f} vs naive {naive_w:.4f}"
+
+
+def test_block_bootstrap_ci_sensitivity_to_block_len():
+    from flowforge.evaluate import _block_bootstrap_ci
+    rng = np.random.default_rng(102)
+    e = rng.normal(size=1500)
+    x = np.zeros_like(e)
+    for i in range(1, len(e)):
+        x[i] = 0.6 * x[i - 1] + e[i]
+    widths = []
+    for bl in (1, 5, 20):
+        lo, hi = _block_bootstrap_ci(x, block_len=bl, n_boot=500, seed=0)
+        widths.append(hi - lo)
+    assert widths[2] > widths[0], widths
+
+
+def test_flow_acf_table_uses_block_bootstrap():
+    from flowforge.evaluate import flow_acf_table
+    rng = np.random.default_rng(103)
+    real = rng.normal(size=(40, 60, 7))
+    gen = rng.normal(size=(40, 60, 7))
+    tab = flow_acf_table(real, gen, lags=(1, 2))
+    for row in tab["rows"]:
+        assert row["ci_method"] == "block_bootstrap_block10", row
+        assert len(row["real_ci"]) == 2
+        assert row["real_ci"][0] <= row["real_ci"][1]
