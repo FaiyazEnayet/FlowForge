@@ -103,5 +103,19 @@
    "real_acf": 0.044340939764108925,
    "gen_acf": 0.006317529836165677
   }
- ]
+ ],
+ "provenance": {
+  "eval_arrays_sha256": "6d177b4440ce9ce82e92f0fd7c179a378cdf936875b04941ead96b542b8c98c5",
+  "metrics_sha256": "e96a1d51a4ad62d595d6bee7563adc194c3d4cee1af079db96e5ab4c5aeb86af",
+  "ddpm_config": {
+   "ch": 96,
+   "n_blocks": 3,
+   "epochs": 300,
+   "ema_decay": null,
+   "params": 221767
+  },
+  "build_seed": 7,
+  "n_windows": 64,
+  "note": "Provenance backfilled for bundle built 2026-10-15; hashes are of the runs/ inputs, not a fresh rebuild."
+ }
 }
