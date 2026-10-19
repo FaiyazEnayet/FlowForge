@@ -28,8 +28,8 @@ Top-of-book quotes and signed trade flow become standardized windows. A regime-c
 
 | Scope | Recorded result or contract |
 | :--- | :--- |
-| Recorded data | 14,378 seconds across eight sessions |
-| Train / validation / test windows | 937 / 199 / 198 |
+| Recorded data | 14,377 seconds across eight sessions (3.99 hours, one BTCUSDT recording span) |
+| Train / validation / test windows | 996 / 168 / 168 |
 | Mean Wasserstein distance | DDPM 0.276; VAE 0.536 |
 | Held-out discriminator AUC | DDPM 0.669; VAE 0.937 |
 | Downstream direction task | DDPM-trained accuracy 0.626, equal to the majority baseline |
@@ -55,7 +55,7 @@ Seven features describe each market-state window: log midprice return, transform
 ```mermaid
 flowchart LR
   N0["Recorded quotes and trades"] --> N1["Market state windows"]
-  N1["Market state windows"] --> N2["Chronological splits"]
+  N1["Market state windows"] --> N2["Session-disjoint splits"]
   N2["Chronological splits"] --> N3["DDPM"]
   N2["Chronological splits"] --> N4["Conditional VAE"]
   N3["DDPM"] --> N5["Held out diagnostics"]
@@ -64,7 +64,9 @@ flowchart LR
 
 ## Evaluation protocol
 
-Windows are assigned chronologically along the concatenated recording timeline. Boundary-straddling windows are dropped, and sessions are not meant to be joined into synthetic continuous market paths. Evaluation asks separate questions about marginal distributions, temporal dependence, distinguishability and downstream utility.
+Splits are session-disjoint: whole recording sessions go to train, validation, or test, never split across them (six sessions train, one validation, one test). No raw second appears in more than one split by construction. Sessions are not meant to be joined into synthetic continuous market paths. The eight sessions are consecutive ~30-minute recordings from a single ~5.6-hour span, not eight independent market days. Evaluation asks separate questions about marginal distributions, temporal dependence, distinguishability and downstream utility.
+
+Model metrics below were computed under the previous split policy and will be refreshed on the next full retrain.
 
 ![Marginal fidelity against the VAE baseline](docs/results.png)
 

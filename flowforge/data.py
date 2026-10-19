@@ -18,13 +18,13 @@ book-state vector built from 1s bars of quotes plus signed trade flow:
 
 Leakage discipline (non-negotiable):
   - Bars are standardized with mean/std fit on the TRAIN split only.
-  - Windows are assigned to train/val/test by their position on the
-    concatenated recording timeline (chunks in chronological order, first
-    70% train, next 15% val, last 15% test). Absolute-clock splits break
-    when sessions are hours apart, so concatenation keeps every split
-    populated while staying strictly chronological. A window belongs to a
-    split only if it lies fully inside that split's range, so no window
-    content is ever shared between splits.
+  - Splits are session-disjoint: whole recording sessions (chunks) are
+    assigned to train, val, or test, never split across them. By default
+    the first 70% of sessions (chronological) go to train, the next 15%
+    to val, and the remainder to test; an explicit session_split manifest
+    locks the assignment before any sweep. No raw second ever appears in
+    two splits by construction, so no window content is ever shared
+    between splits.
   - Windows never cross chunk boundaries (recording gaps/resyncs): seconds
     are segmented per chunk and a new segment starts at every missing
     second, so each segment is a run of consecutive seconds. Windows are
@@ -43,6 +43,7 @@ Standardized with train statistics.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -74,6 +75,7 @@ class SplitWindows:
     regime: np.ndarray     # (n_windows, 2) standardized [vol, spread]
     t_start: np.ndarray    # window start time in seconds (absolute)
     t_end: np.ndarray      # window end time in seconds (absolute)
+    session_ids: np.ndarray  # (n_windows,) int: source chunk index per window
 
 
 @dataclass
@@ -87,12 +89,26 @@ class BookDataset:
     regime_std: np.ndarray = field(repr=False)
     n_seconds: int = 0
     n_chunks: int = 0
+    chunk_dirs: list = field(default_factory=list, repr=False)
+    chunk_hashes: list = field(default_factory=list, repr=False)
+    chunk_symbols: list = field(default_factory=list, repr=False)
+    chunk_stats: list = field(default_factory=list, repr=False)
+    session_split: dict = field(default_factory=dict, repr=False)
 
 
 def _load_chunk(chunk_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     q = pd.read_parquet(f"{chunk_dir}/quotes.parquet")
     t = pd.read_parquet(f"{chunk_dir}/trades.parquet")
     return q, t
+
+
+def _chunk_symbol(chunk_dir: str) -> str:
+    """Recording symbol from the chunk's meta.json, if present."""
+    try:
+        with open(os.path.join(chunk_dir, "meta.json")) as f:
+            return str(json.load(f).get("symbol", "unknown"))
+    except (OSError, ValueError):
+        return "unknown"
 
 
 def _bars_from_chunk(q: pd.DataFrame, t: pd.DataFrame) -> pd.DataFrame:
@@ -164,50 +180,95 @@ def _windows_in_segment(seg: pd.DataFrame) -> list[tuple[int, int]]:
     return out
 
 
-def build_dataset(chunk_dirs: list[str]) -> BookDataset:
-    """Load chunks, build 1s bars, split by time, emit standardized windows."""
-    all_bars = []
+def build_dataset(chunk_dirs: list[str],
+                  session_split: dict[str, list[int]] | None = None) -> BookDataset:
+    """Load chunks, build 1s bars, split by session, emit standardized windows.
+
+    Session-disjoint splits (FL3): whole recording sessions (chunks) are
+    assigned to splits, never split across them. By default, chunks are
+    assigned chronologically: first 70% train, next 15% val, remainder test
+    (by chunk count, rounding). Pass an explicit `session_split` manifest
+    like {"train": [0,1,2,3,4], "val": [5], "test": [6,7]} to lock test
+    session identities before sweeps. Chunk indices refer to chronological
+    order. No raw second ever appears in two splits by construction.
+    """
+    import hashlib
+    # Parallel kept-lists: a chunk with no usable bars is skipped, and the
+    # surviving entries stay aligned (dir <-> bars <-> hash <-> symbol).
+    kept_dirs: list[str] = []
+    kept_bars = []
+    kept_hashes: list[str] = []
+    kept_symbols: list[str] = []
+    kept_stats: list[dict] = []
     for d in chunk_dirs:
         q, t = _load_chunk(d)
+        # hash the raw inputs for the manifest
+        h = hashlib.sha256()
+        h.update(q.to_numpy().tobytes())
+        h.update(t.to_numpy().tobytes())
         b = _bars_from_chunk(q, t)
-        if len(b) > 0:
-            all_bars.append(b)
-    if not all_bars:
+        if len(b) == 0:
+            continue
+        span = int(b.index.max() - b.index.min()) + 1
+        kept_dirs.append(d)
+        kept_bars.append(b)
+        kept_hashes.append(h.hexdigest()[:16])
+        kept_symbols.append(_chunk_symbol(d))
+        kept_stats.append({"span": span, "usable": int(len(b)),
+                           "missing": span - int(len(b))})
+    if not kept_bars:
         raise ValueError("no usable bars in any chunk")
-    n_seconds = int(sum(len(b) for b in all_bars))
+    n_seconds = int(sum(len(b) for b in kept_bars))
 
-    # Split by position on the concatenated recording timeline (chunks in
-    # chronological order). Splitting by absolute clock time breaks when
-    # sessions are hours apart: the middle split can land entirely inside a
-    # recording gap. Concatenated order keeps the split chronological with
-    # zero leakage, and puts later sessions (different time of day) in test.
-    order = sorted(range(len(all_bars)),
-                   key=lambda i: all_bars[i].index.min())
-    ordered = [all_bars[i] for i in order]
-    # guard: overlapping sessions would put the same market seconds in two
-    # chunks, which the concatenated split could then separate into
-    # different splits (silent leakage). Recordings are sequential, so
-    # overlap is always a data bug. Fail loudly.
+    # Sort chunks chronologically; guard against overlapping sessions.
+    order = sorted(range(len(kept_bars)),
+                   key=lambda i: kept_bars[i].index.min())
+    ordered = [kept_bars[i] for i in order]
+    ordered_dirs = [kept_dirs[i] for i in order]
+    ordered_hashes = [kept_hashes[i] for i in order]
+    ordered_symbols = [kept_symbols[i] for i in order]
+    ordered_stats = [kept_stats[i] for i in order]
     for prev, cur in zip(ordered[:-1], ordered[1:]):
         assert cur.index.min() > prev.index.max(), \
             "chunk time ranges overlap; sort/deduplicate recording sessions"
-    chunk_t0 = [b.index.min() for b in ordered]
-    spans = [int(b.index.max() - b.index.min()) + 1 for b in ordered]
-    total = sum(spans)
-    cut1 = TRAIN_FRAC * total
-    cut2 = (TRAIN_FRAC + VAL_FRAC) * total
-    offsets = []
-    acc = 0
-    for s in spans:
-        offsets.append(acc)
-        acc += s
-    splits = {"train": (0.0, cut1), "val": (cut1, cut2), "test": (cut2, float(total))}
+
+    n = len(ordered)
+    if session_split is None:
+        # Default: chronological 70/15/15 by chunk count, whole sessions.
+        # Fewer than three sessions cannot populate three disjoint splits.
+        if n < 3:
+            raise ValueError(
+                f"need at least 3 sessions for session-disjoint "
+                f"train/val/test splits, got {n}; pass an explicit "
+                f"session_split or add sessions")
+        n_test = max(1, int(round(n * (1.0 - TRAIN_FRAC - VAL_FRAC))))
+        n_val = max(1, int(round(n * VAL_FRAC)))
+        n_train = n - n_test - n_val
+        session_split = {
+            "train": list(range(n_train)),
+            "val": list(range(n_train, n_train + n_val)),
+            "test": list(range(n_train + n_val, n)),
+        }
+    # Validate the manifest covers every chunk exactly once.
+    seen = []
+    for name in ("train", "val", "test"):
+        if name not in session_split:
+            raise ValueError(f"session_split missing '{name}'")
+        seen.extend(session_split[name])
+    if sorted(seen) != list(range(n)):
+        raise ValueError("session_split must assign each chunk exactly once")
+    chunk_to_split = {}
+    for name, idxs in session_split.items():
+        for i in idxs:
+            chunk_to_split[i] = name
 
     raw: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_regime: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_t: dict[str, list] = {"train": [], "val": [], "test": []}
+    raw_session: dict[str, list] = {"train": [], "val": [], "test": []}
 
     for ci, b in enumerate(ordered):
+        split = chunk_to_split[ci]
         for seg in _segments(b):
             if len(seg) < LOOKBACK + WINDOW:
                 continue
@@ -217,17 +278,6 @@ def build_dataset(chunk_dirs: list[str]) -> BookDataset:
             spread = seg["spread_bps"].to_numpy(dtype=np.float64)
             for start, end in _windows_in_segment(seg):
                 w_t0, w_t1 = secs[start], secs[end - 1]
-                # position on the concatenated timeline (chunk offset +
-                # seconds since this chunk started)
-                c0 = offsets[ci] + (w_t0 - chunk_t0[ci])
-                c1 = offsets[ci] + (w_t1 - chunk_t0[ci])
-                split = None
-                for name, (lo, hi) in splits.items():
-                    if c0 >= lo and c1 <= hi:
-                        split = name
-                        break
-                if split is None:  # straddles a cut: drop, never share
-                    continue
                 win = arr[start:end]
                 # regime from strictly-past lookback: ends at the window
                 # start, never includes the window itself
@@ -237,10 +287,11 @@ def build_dataset(chunk_dirs: list[str]) -> BookDataset:
                 raw[split].append(win)
                 raw_regime[split].append([vol, sp])
                 raw_t[split].append((float(w_t0), float(w_t1)))
+                raw_session[split].append(ci)
 
     for name in raw:
         if not raw[name]:
-            raise ValueError(f"no windows in split '{name}'; check split fractions")
+            raise ValueError(f"no windows in split '{name}'; check session_split")
 
     # standardize with TRAIN statistics only (no leakage from val/test)
     train_x = np.stack(raw["train"])
@@ -256,40 +307,148 @@ def build_dataset(chunk_dirs: list[str]) -> BookDataset:
         x = (np.stack(raw[name]) - f_mean) / f_std
         r = (np.asarray(raw_regime[name], dtype=np.float64) - r_mean) / r_std
         tt = np.asarray(raw_t[name], dtype=np.float64)
+        ss = np.asarray(raw_session[name], dtype=np.int64)
         assert np.isfinite(x).all() and np.isfinite(r).all()
         return SplitWindows(x=x.astype(np.float32), regime=r.astype(np.float32),
-                            t_start=tt[:, 0], t_end=tt[:, 1])
+                            t_start=tt[:, 0], t_end=tt[:, 1],
+                            session_ids=ss)
 
     return BookDataset(
         train=pack("train"), val=pack("val"), test=pack("test"),
         feature_mean=f_mean, feature_std=f_std,
         regime_mean=r_mean, regime_std=r_std,
-        n_seconds=n_seconds, n_chunks=len(all_bars),
+        n_seconds=n_seconds, n_chunks=len(ordered),
+        chunk_dirs=ordered_dirs, chunk_hashes=ordered_hashes,
+        chunk_symbols=ordered_symbols, chunk_stats=ordered_stats,
+        session_split={k: list(v) for k, v in session_split.items()},
     )
 
 
+def write_manifest(ds: BookDataset, path: str) -> None:
+    """Write the split manifest: chunk identities, hashes, and split assignment.
+
+    This is the provenance record. Test session identities are fixed here
+    before any sweep; reruns with the same manifest reproduce the split.
+    """
+    import json
+    from datetime import datetime, timezone
+    manifest = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "n_chunks": ds.n_chunks,
+        "n_seconds": ds.n_seconds,
+        "chunks": [
+            {"session_id": i, "dir": d, "symbol": sym, "sha16": h,
+             "split": next(s for s, idxs in ds.session_split.items() if i in idxs),
+             "seconds_span": st["span"], "seconds_usable": st["usable"],
+             "seconds_missing": st["missing"]}
+            for i, (d, h, sym, st) in enumerate(zip(
+                ds.chunk_dirs, ds.chunk_hashes, ds.chunk_symbols, ds.chunk_stats))
+        ],
+        "session_split": ds.session_split,
+        "windows": {s: int(getattr(ds, s).x.shape[0])
+                    for s in ("train", "val", "test")},
+    }
+    # Integrity check: no session appears in two splits.
+    seen_sessions = {}
+    for s in ("train", "val", "test"):
+        for sid in np.unique(getattr(ds, s).session_ids).tolist():
+            assert sid not in seen_sessions, f"session {sid} in two splits"
+            seen_sessions[sid] = s
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=1)
+    return manifest
+
+
+def dataset_card(ds: BookDataset) -> str:
+    """Markdown dataset card: sessions, hours, symbols, missingness."""
+    lines = ["# Dataset card: book-state windows", ""]
+    lines.append(f"- Sessions (chunks): {ds.n_chunks}")
+    lines.append(f"- Total seconds of book data: {ds.n_seconds} "
+                 f"({ds.n_seconds / 3600:.2f} hours)")
+    symbols = sorted(set(ds.chunk_symbols)) if ds.chunk_symbols else ["unknown"]
+    lines.append(f"- Symbols: {', '.join(symbols)}")
+    if ds.chunk_stats:
+        total_span = sum(s["span"] for s in ds.chunk_stats)
+        total_missing = sum(s["missing"] for s in ds.chunk_stats)
+        lines.append(f"- Missingness: {total_missing} of {total_span} "
+                     f"session-seconds have no usable bar (recording gaps; "
+                     f"the bar after a gap is dropped)")
+    lines.append("")
+    lines.append("## Split manifest (session-disjoint)")
+    lines.append("")
+    lines.append("| Split | Sessions | Windows |")
+    lines.append("|-------|----------|---------|")
+    for s in ("train", "val", "test"):
+        sw = getattr(ds, s)
+        n_sess = len(np.unique(sw.session_ids))
+        lines.append(f"| {s} | {n_sess} | {sw.x.shape[0]} |")
+    lines.append("")
+    lines.append("## Sessions")
+    lines.append("")
+    lines.append("| ID | Directory | Symbol | SHA16 | Split | Span (s) | "
+                 "Usable (s) | Missing (s) |")
+    lines.append("|----|-----------|--------|-------|-------|----------|"
+                 "------------|-------------|")
+    for i, (d, sym, h, st) in enumerate(zip(
+            ds.chunk_dirs, ds.chunk_symbols, ds.chunk_hashes, ds.chunk_stats)):
+        split = next(s for s, idxs in ds.session_split.items() if i in idxs)
+        lines.append(f"| {i} | {d} | {sym} | {h} | {split} | {st['span']} | "
+                     f"{st['usable']} | {st['missing']} |")
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("- Windows never cross chunk boundaries; every 60-row window "
+                 "spans exactly 59 seconds.")
+    lines.append("- No raw second appears in more than one split by construction "
+                 "(whole sessions assigned).")
+    lines.append("- Features standardized with train-split statistics only.")
+    return "\n".join(lines)
+
+
 def save_dataset(ds: BookDataset, path: str) -> None:
+    import json
     np.savez_compressed(
         path,
         **{f"{s}_{k}": getattr(getattr(ds, s), k)
            for s in ("train", "val", "test")
-           for k in ("x", "regime", "t_start", "t_end")},
+           for k in ("x", "regime", "t_start", "t_end", "session_ids")},
         feature_mean=ds.feature_mean, feature_std=ds.feature_std,
         regime_mean=ds.regime_mean, regime_std=ds.regime_std,
         n_seconds=np.array(ds.n_seconds), n_chunks=np.array(ds.n_chunks),
+        chunk_dirs=np.array(ds.chunk_dirs, dtype=object),
+        chunk_hashes=np.array(ds.chunk_hashes, dtype=object),
+        chunk_symbols=np.array(ds.chunk_symbols, dtype=object),
+        chunk_stats_json=np.array(json.dumps(ds.chunk_stats)),
+        session_split_json=np.array(json.dumps(ds.session_split)),
     )
 
 
 def load_dataset(path: str) -> BookDataset:
-    z = np.load(path, allow_pickle=False)
+    import json
+    z = np.load(path, allow_pickle=True)
 
     def unpack(s: str) -> SplitWindows:
+        # session_ids may be absent in datasets built before FL3.
+        if f"{s}_session_ids" in z:
+            ss = z[f"{s}_session_ids"]
+        else:
+            ss = np.full(z[f"{s}_x"].shape[0], -1, dtype=np.int64)
         return SplitWindows(x=z[f"{s}_x"], regime=z[f"{s}_regime"],
-                            t_start=z[f"{s}_t_start"], t_end=z[f"{s}_t_end"])
+                            t_start=z[f"{s}_t_start"], t_end=z[f"{s}_t_end"],
+                            session_ids=ss)
 
+    def _str_list(key):
+        return [str(x) for x in z[key].tolist()] if key in z else []
+
+    split = json.loads(str(z["session_split_json"])) if "session_split_json" in z else {}
+    stats = json.loads(str(z["chunk_stats_json"])) if "chunk_stats_json" in z else []
     return BookDataset(
         train=unpack("train"), val=unpack("val"), test=unpack("test"),
         feature_mean=z["feature_mean"], feature_std=z["feature_std"],
         regime_mean=z["regime_mean"], regime_std=z["regime_std"],
         n_seconds=int(z["n_seconds"]), n_chunks=int(z["n_chunks"]),
+        chunk_dirs=_str_list("chunk_dirs"),
+        chunk_hashes=_str_list("chunk_hashes"),
+        chunk_symbols=_str_list("chunk_symbols"),
+        chunk_stats=stats,
+        session_split=split,
     )

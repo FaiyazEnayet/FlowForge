@@ -1,6 +1,6 @@
 """End to end: train on real windows, generate, evaluate honestly.
 
-1. Loads the book-state windows (time-split: train/val/test, no overlap).
+1. Loads the book-state windows (session-disjoint split: train/val/test, no shared sessions).
 2. Trains the conditional VAE baseline and the DDPM on TRAIN only.
 3. Generates windows conditioned on VAL and TEST regime features.
 4. Prints the full real-vs-generated report on TEST (never seen by either
