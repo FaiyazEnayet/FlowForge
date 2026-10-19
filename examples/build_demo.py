@@ -8,8 +8,14 @@ clone with no data/ or runs/ (both gitignored). Deterministic: seed 7.
 Nothing here invents data. The generated windows are outputs of the DDPM
 trained in examples/demo.py; the metrics are copied verbatim from
 runs/metrics.json.
+
+Provenance (FL7): the bundle records SHA256 hashes of its inputs
+(eval_arrays.npz, metrics.json) and the effective config, so the bundle
+can be traced back to the exact run that produced it. See REPRODUCE.md
+for the full pipeline from raw recordings to this bundle.
 """
 
+import hashlib
 import json
 import os
 
@@ -25,6 +31,14 @@ N_WINDOWS = 64  # real + 64 generated windows in the bundle
 FEATURES = ["log_ret", "log_spread_bps", "log_bid_sz", "log_ask_sz",
             "imbalance", "signed_flow", "log_trade_count"]
 assert len(FEATURES) == 7
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def main():
@@ -79,12 +93,27 @@ def main():
         },
         "marginals": ddpm["marginals"]["rows"],
         "flow_acf": ddpm["flow_acf"]["rows"],
+        # FL7 provenance: hashes of the exact inputs that produced this
+        # bundle, plus the effective config. The bundle is reproducible
+        # from these inputs with seed 7; see REPRODUCE.md.
+        "provenance": {
+            "eval_arrays_sha256": _sha256_file(
+                os.path.join(RUNS, "eval_arrays.npz")),
+            "metrics_sha256": _sha256_file(
+                os.path.join(RUNS, "metrics.json")),
+            "ddpm_config": metrics["ddpm_config"],
+            "build_seed": SEED,
+            "n_windows": N_WINDOWS,
+        },
     }
     with open(os.path.join(DEMO, "metrics.json"), "w") as f:
         json.dump(summary, f, indent=1)
     print(f"bundle -> demo/demo.npz ({N_WINDOWS} real + {N_WINDOWS} generated "
           f"windows, seed {SEED})")
     print("metrics -> demo/metrics.json")
+    print(f"provenance: eval_arrays "
+          f"{summary['provenance']['eval_arrays_sha256'][:16]}..., "
+          f"metrics {summary['provenance']['metrics_sha256'][:16]}...")
 
 
 if __name__ == "__main__":

@@ -122,3 +122,28 @@ def test_committed_demo_bundle_loads():
     assert 0.5 < b["disc_auc"] < 1.0
     assert set(b["metrics"]["models"]) == {"ddpm", "vae"}
     assert len(b["metrics"]["marginals"]) == N_FEATURES
+
+
+def test_demo_bundle_provenance():
+    # FL7 smoke test: the shipped bundle must carry provenance hashes and
+    # config so it can be traced to the exact run that produced it.
+    # Offline: needs only the repo, no raw data.
+    import json
+    mp = os.path.join(DEMO_DIR, "metrics.json")
+    if not os.path.exists(mp):
+        pytest.skip("demo bundle not built in this checkout")
+    with open(mp) as f:
+        metrics = json.load(f)
+    assert "provenance" in metrics, "bundle missing provenance (rebuild with build_demo.py)"
+    prov = metrics["provenance"]
+    for key in ("eval_arrays_sha256", "metrics_sha256", "ddpm_config",
+                "build_seed", "n_windows"):
+        assert key in prov, f"provenance missing {key}"
+    assert len(prov["eval_arrays_sha256"]) == 64
+    assert len(prov["metrics_sha256"]) == 64
+    assert prov["build_seed"] == 7
+    # bundle arrays are finite
+    bp = os.path.join(DEMO_DIR, "demo.npz")
+    z = np.load(bp)
+    assert np.isfinite(z["real_windows"]).all()
+    assert np.isfinite(z["gen_windows"]).all()
