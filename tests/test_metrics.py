@@ -159,3 +159,42 @@ def test_tstr_recovers_learnable_structure():
     assert out["acc_real"] > 0.9, out
     assert 0.0 <= out["majority"] <= 1.0
     assert out["n_test"] == 60
+
+
+def test_book_consistency_detects_violation():
+    """FL2: independent imbalance feature violates the physical constraint."""
+    from flowforge.evaluate import book_consistency_table
+    rng = np.random.default_rng(0)
+    n, w = 10, 60
+    # Standardized gen windows; physical units via mean/std.
+    f_mean = np.zeros(7)
+    f_std = np.ones(7)
+    gen = rng.normal(size=(n, w, 7)) * 0.1
+    j_bid = FEATURE_NAMES.index("log_bid_sz")
+    j_ask = FEATURE_NAMES.index("log_ask_sz")
+    j_imb = FEATURE_NAMES.index("imbalance")
+    # Set bid/ask sizes to imply imbalance ~0.5, but set the imbalance
+    # feature to -0.5 (violation).
+    gen[:, :, j_bid] = np.log(3.0)  # bid=3
+    gen[:, :, j_ask] = np.log(1.0)  # ask=1 -> implied imb = 0.5
+    gen[:, :, j_imb] = -0.5  # violates the constraint
+    rep = book_consistency_table(gen, f_mean, f_std)
+    assert rep["imbalance_violation_rate"] == 1.0
+    assert rep["imbalance_mae"] == 1.0  # |-0.5 - 0.5| = 1.0
+
+
+def test_constrain_imbalance_fixes_violation():
+    """FL2: deriving imbalance from sizes yields zero violation rate."""
+    from flowforge.evaluate import (book_consistency_table,
+                                    constrain_imbalance)
+    rng = np.random.default_rng(1)
+    n, w = 10, 60
+    f_mean = np.zeros(7)
+    f_std = np.ones(7)
+    gen = rng.normal(size=(n, w, 7)) * 0.1
+    j_imb = FEATURE_NAMES.index("imbalance")
+    gen[:, :, j_imb] = rng.uniform(-1, 1, size=(n, w))  # arbitrary
+    fixed = constrain_imbalance(gen, f_mean, f_std)
+    rep = book_consistency_table(fixed, f_mean, f_std)
+    assert rep["imbalance_violation_rate"] == 0.0
+    assert rep["imbalance_mae"] == 0.0
