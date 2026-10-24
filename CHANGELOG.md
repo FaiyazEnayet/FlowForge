@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+### Docs
+- Centered the README header: uniform dark badge labels and three action buttons in the dashboard palette (Open Demo, Explore Method, Run Locally).
+
 ## [v1.3.0] - 2026-10-18
 ### Added
 - Book consistency audit (`flowforge/evaluate.py`). The generator emits log bid size, log ask size, and imbalance as independent features, but physically imbalance must equal (bid_sz - ask_sz) / (bid_sz + ask_sz). `book_consistency_table` measures the violation rate after inverse-transforming to physical units, plus negative implied spread/count checks. `constrain_imbalance` derives the imbalance feature from the generated sizes (constrained decoding). The full evaluation report now includes pre/post consistency tables and the marginal Wasserstein distance before/after the constraint.
