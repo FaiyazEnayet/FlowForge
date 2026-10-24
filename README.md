@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml"><img src="https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml/badge.svg?label=CI&labelColor=24292f" alt="CI"></a>
-  <img src="https://img.shields.io/badge/license-MIT-d3a484?labelColor=24292f" alt="License: MIT">
+  <img src="https://img.shields.io/badge/license-MIT-fffbf0?labelColor=24292f" alt="License: MIT">
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?labelColor=24292f" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/built%20with-PyTorch%20%2B%20diffusion-C2410C?labelColor=24292f" alt="Built with PyTorch + diffusion">
 </p>
