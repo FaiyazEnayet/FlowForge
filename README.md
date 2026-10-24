@@ -1,15 +1,26 @@
 <p align="center"><img src="docs/readme-banner.svg?v=type-20261017b" alt="FlowForge: Conditional diffusion for market microstructure" width="1200"></p>
 
-[![Tests](https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml/badge.svg)](https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-007EC6)](LICENSE) ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB) ![Built with PyTorch + diffusion](https://img.shields.io/badge/built%20with-PyTorch%20%2B%20diffusion-555555) [![Interactive demo](https://img.shields.io/badge/demo-interactive-4C9D39)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
+<h1 align="center">FlowForge</h1>
 
-<p align="center"><a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><b>Open interactive demo</b></a> · <a href="#method">Method</a> · <a href="#run-locally">Run locally</a></p>
+<p align="center">Conditional diffusion models that generate short market-state sequences from recorded BTCUSDT data.</p>
 
-# FlowForge
+<p align="center">
+  <a href="https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml"><img src="https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml/badge.svg?label=CI&labelColor=24292f" alt="CI"></a>
+  <img src="https://img.shields.io/badge/license-MIT-d3a484?labelColor=24292f" alt="License: MIT">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?labelColor=24292f" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/built%20with-PyTorch%20%2B%20diffusion-C2410C?labelColor=24292f" alt="Built with PyTorch + diffusion">
+</p>
+
+<p align="center">
+  <a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><img src="https://img.shields.io/badge/Open-Demo-d3a484?style=for-the-badge&labelColor=0c1727" alt="Open Demo"></a>
+  <a href="#method"><img src="https://img.shields.io/badge/Explore-Method-30475d?style=for-the-badge&labelColor=0c1727" alt="Explore Method"></a>
+  <a href="#run-locally"><img src="https://img.shields.io/badge/Run-Locally-111f32?style=for-the-badge&labelColor=0c1727" alt="Run Locally"></a>
+</p>
 
 FlowForge generates short market-state sequences from recorded BTCUSDT data. The central question is whether a model can reproduce observed market behavior, not whether its output merely looks plausible.
 
 
-[![FlowForge demo](docs/demo.gif?v=showcase-20261017b)](https://faiyazenayet.github.io/FlowForge/docs/dashboard.html)
+<p align="center"><a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><img src="docs/demo.gif?v=showcase-20261017b" alt="FlowForge demo"></a></p>
 
 
 Useful synthetic market data must preserve more than a plausible price trace. The sequence explorer connects local behavior with distributional distances and temporal dependence, making it easier to spot a generator that matches marginal statistics while missing market dynamics. Real and generated windows are independently sampled and compared by their relative time offsets.
