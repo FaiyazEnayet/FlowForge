@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><img src="https://img.shields.io/badge/Open-Demo-0d0d6f?style=for-the-badge&labelColor=0c1727" alt="Open Demo"></a>
+  <a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><img src="https://img.shields.io/badge/Open-Demo-0C0D62?style=for-the-badge&labelColor=0c1727" alt="Open Demo"></a>
   <a href="#method"><img src="https://img.shields.io/badge/Explore-Method-30475d?style=for-the-badge&labelColor=0c1727" alt="Explore Method"></a>
   <a href="#run-locally"><img src="https://img.shields.io/badge/Run-Locally-111f32?style=for-the-badge&labelColor=0c1727" alt="Run Locally"></a>
 </p>
