@@ -2,8 +2,6 @@
 
 <h1 align="center">FlowForge</h1>
 
-<p align="center">Conditional diffusion models that generate short market-state sequences from recorded BTCUSDT data.</p>
-
 <p align="center">
   <a href="https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml"><img src="https://github.com/FaiyazEnayet/FlowForge/actions/workflows/ci.yml/badge.svg?label=CI&labelColor=24292f" alt="CI"></a>
   <img src="https://img.shields.io/badge/license-MIT-d3a484?labelColor=24292f" alt="License: MIT">
