@@ -84,7 +84,7 @@ The diffusion result improves on the VAE in mean Wasserstein distance, but a dis
 
 ## Code and data
 
-`flowforge/data.py` owns window construction and split discipline. `models.py` defines the VAE and DDPM. `evaluate.py` owns the evaluation. `demo/` contains the compact recorded result bundle.
+`flowforge/data.py` owns window construction and split discipline. `flowforge/models.py` defines the VAE and DDPM. `flowforge/evaluate.py` owns the evaluation. `demo/` contains the compact recorded result bundle.
 
 
 ## Limitations
