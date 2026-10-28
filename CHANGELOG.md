@@ -3,6 +3,11 @@
 ## Unreleased
 ### Docs
 - Centered the README header: uniform dark badge labels and three action buttons in the dashboard palette (Open Demo, Explore Method, Run Locally).
+### Fixed
+- Sweep discriminator leakage (`examples/sweep.py`): the discriminator used to fit on generated validation windows and score on those same windows, and its docstring described train-regime generations the code never produced. The sweep now splits validation into temporally disjoint fit and score blocks separated by window length plus lookback (120s), generates each block separately from that block's regimes, fits the discriminator on the fit block only, and reports W1 and AUC on the score block. When either block is too small, the discriminator score is reported as insufficient instead of falling back to overlapping windows. `runs/sweep.json` now records the protocol version, the training data hash, the block sizes and gap, the selection rule, and the winner name, kind, and config.
+- Demo config no longer silent (`examples/demo.py`): the DDPM config used to come from environment variables with hardcoded defaults, so it could drift from the sweep winner without any record. The demo now resolves its DDPM config from the frozen sweep winner when the winner is a neural model, requires all four explicit environment variables otherwise, and records the sweep winner (name, kind, source) in `runs/metrics.json`. A baseline sweep winner is recorded plainly.
+### Tests
+- 9 new regression tests in `tests/test_stage3_flowforge_01.py` (disjoint fit/score blocks including lookbacks, gap windows dropped, score-block AUC detection, near-chance identical distributions, insufficient-samples admission, demo config resolution from sweep winner, baseline winner recording, explicit-config requirement).
 
 ## [v1.3.0] - 2026-10-18
 ### Added
