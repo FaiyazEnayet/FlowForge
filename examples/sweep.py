@@ -32,7 +32,8 @@ import numpy as np
 import torch
 
 from flowforge.baselines import MovingBlockResampler, VARBaseline
-from flowforge.data import WINDOW, LOOKBACK, load_dataset
+from flowforge.data import (WINDOW, LOOKBACK, check_manifest_file,
+                            ensure_publishable, load_dataset)
 from flowforge.evaluate import (discriminator_auc, marginal_table,
                                 wasserstein_1d)
 from flowforge.models import (BookDDPM, count_params, sample_with_ema,
@@ -144,6 +145,17 @@ def main():
     t0 = time.time()
     set_seed(SEED)
     ds = load_dataset(os.path.abspath(DATA))
+    # Provenance gate (C02), before any training: legacy datasets cannot
+    # publish sweep evidence, and a manifest file on disk that disagrees
+    # with the NPZ aborts the run. A missing manifest file is not fatal:
+    # the NPZ embeds its own manifest, and that is what gets cited.
+    ensure_publishable(ds)
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(DATA)),
+                                 "split_manifest.json")
+    if not check_manifest_file(ds, os.path.abspath(manifest_path)):
+        print("note: no split manifest on disk; proceeding on the "
+              "NPZ-embedded manifest only")
+    print(f"split-manifest SHA-256: {ds.manifest_sha256}")
     x_train = torch.from_numpy(ds.train.x)
     r_train = torch.from_numpy(ds.train.regime)
     val = ds.val
@@ -257,6 +269,7 @@ def main():
     os.makedirs(RUNS, exist_ok=True)
     artifact = {"protocol": "disjoint-discriminator", "protocol_version": 1,
                 "seed": SEED, "data_sha256": sha256_file(os.path.abspath(DATA)),
+                "split_manifest_sha256": ds.manifest_sha256,
                 "selection_rule": "lowest val mean W1, tie-break lower "
                                   "score-block disc AUC (disc skipped when "
                                   "a block is below MIN_BLOCK windows)",

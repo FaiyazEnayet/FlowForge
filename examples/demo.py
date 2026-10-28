@@ -16,7 +16,8 @@ import time
 import numpy as np
 import torch
 
-from flowforge.data import load_dataset
+from flowforge.data import (check_manifest_file, ensure_publishable,
+                            load_dataset)
 from flowforge.evaluate import full_report, print_report
 from flowforge.models import (BookDDPM, CondVAE, count_params,
                               sample_with_ema, set_seed, train_ddpm,
@@ -92,6 +93,17 @@ def main():
     print(f"DDPM config: ch={cfg['ch']} blocks={cfg['n_blocks']} "
           f"epochs={cfg['epochs']} ema={cfg['ema_decay']}")
     ds = load_dataset(os.path.abspath(DATA))
+    # Provenance gate (C02), before any training: legacy datasets cannot
+    # publish metrics, and a manifest file on disk that disagrees with
+    # the NPZ aborts the run. A missing manifest file is not fatal: the
+    # NPZ embeds its own manifest, and that is what gets cited.
+    ensure_publishable(ds)
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(DATA)),
+                                 "split_manifest.json")
+    if not check_manifest_file(ds, os.path.abspath(manifest_path)):
+        print("note: no split manifest on disk; proceeding on the "
+              "NPZ-embedded manifest only")
+    print(f"split-manifest SHA-256: {ds.manifest_sha256}")
     print(f"data: {ds.n_chunks} chunks, {ds.n_seconds}s -> "
           f"{len(ds.train.x)}/{len(ds.val.x)}/{len(ds.test.x)} "
           f"train/val/test windows")
@@ -152,6 +164,8 @@ def main():
         "n_train": len(ds.train.x), "n_val": len(ds.val.x),
         "n_test": len(ds.test.x),
         "seconds": ds.n_seconds, "chunks": ds.n_chunks,
+        "split_manifest_sha256": ds.manifest_sha256,
+        "dataset_legacy": False,
         "ddpm_config": {"ch": cfg["ch"], "n_blocks": cfg["n_blocks"],
                         "epochs": cfg["epochs"], "ema_decay": cfg["ema_decay"],
                         "params": count_params(ddpm),

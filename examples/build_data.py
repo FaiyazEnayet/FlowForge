@@ -6,7 +6,9 @@ Usage:
 
 Writes data/book_windows.npz (gitignored; rebuild it yourself), plus
 data/split_manifest.json (chunk hashes and session-disjoint split
-assignment) and data/dataset_card.md (sessions, hours, splits).
+assignment) and data/dataset_card.md (sessions, hours, splits). The
+manifest and card are committed: they are sanitized (chunk directories
+as basenames only, no local paths) and contain hashes, not raw data.
 
 Splits are session-disjoint: whole recording sessions go to train, val,
 or test, never split across them. By default the first 70% of sessions
@@ -37,13 +39,32 @@ def parse_split(spec: str | None) -> dict[str, list[int]] | None:
     return out
 
 
+def _code_sha() -> str | None:
+    """Current repo HEAD commit, for the manifest's code SHA field.
+
+    Returns None outside a git checkout (or when git fails): the field
+    is recorded as null rather than invented.
+    """
+    import subprocess
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                             capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("chunks", nargs="+", help="chunk directories")
     ap.add_argument("--split", default=None,
                     help='explicit manifest, e.g. "train:0,1,2,3,4 val:5 test:6,7"')
     args = ap.parse_args()
-    ds = build_dataset(args.chunks, session_split=parse_split(args.split))
+    ds = build_dataset(args.chunks, session_split=parse_split(args.split),
+                       code_sha=_code_sha())
     os.makedirs(os.path.dirname(os.path.abspath(OUT)), exist_ok=True)
     save_dataset(ds, os.path.abspath(OUT))
     manifest = write_manifest(ds, os.path.abspath(MANIFEST))
@@ -58,6 +79,7 @@ def main() -> None:
     print(f"wrote {os.path.abspath(MANIFEST)}")
     print(f"wrote {os.path.abspath(CARD)}")
     print("split manifest:", manifest["session_split"])
+    print(f"split-manifest SHA-256: {ds.manifest_sha256}")
 
 
 if __name__ == "__main__":
