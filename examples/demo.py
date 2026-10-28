@@ -26,18 +26,71 @@ SEED = 7
 DATA = os.path.join(os.path.dirname(__file__), "..", "data", "book_windows.npz")
 RUNS = os.path.join(os.path.dirname(__file__), "..", "runs")
 
-# DDPM config: winner of examples/sweep.py on the validation split.
-# Override with FF_DDPM_CH / FF_DDPM_BLOCKS / FF_DDPM_EPOCHS / FF_DDPM_EMA.
-DDPM_CH = int(os.environ.get("FF_DDPM_CH", "96"))
-DDPM_BLOCKS = int(os.environ.get("FF_DDPM_BLOCKS", "3"))
-DDPM_EPOCHS = int(os.environ.get("FF_DDPM_EPOCHS", "300"))
-_ema_raw = os.environ.get("FF_DDPM_EMA", "")
-DDPM_EMA = float(_ema_raw) if _ema_raw else None
+ENV_CONFIG_KEYS = ("FF_DDPM_CH", "FF_DDPM_BLOCKS",
+                   "FF_DDPM_EPOCHS", "FF_DDPM_EMA")
+
+
+def resolve_ddpm_config(sweep_path=None, env=None):
+    """Resolve the DDPM config from a frozen source, never silent defaults.
+
+    Sources, in order: the sweep winner config in runs/sweep.json when the
+    winner is a neural model; explicit FF_DDPM_* environment variables
+    (all four required) otherwise. A baseline sweep winner is recorded
+    plainly and still requires an explicit DDPM config for the demo run.
+    Raises RuntimeError when no frozen config is available.
+    Returns (config dict, winner dict with name/kind/source).
+    """
+    if env is None:
+        env = os.environ
+    if sweep_path is None:
+        sweep_path = os.path.join(RUNS, "sweep.json")
+    winner = None
+    if os.path.exists(sweep_path):
+        try:
+            with open(sweep_path) as f:
+                artifact = json.load(f)
+            w = artifact["winner"]
+            name, kind = w["name"], w.get("kind")
+            if kind is None:
+                kind = ("baseline" if name.startswith("baseline_")
+                        else "neural")
+            if kind == "neural":
+                cfg = w["config"]
+                return ({"ch": int(cfg["ch"]),
+                         "n_blocks": int(cfg["n_blocks"]),
+                         "epochs": int(cfg["epochs"]),
+                         "ema_decay": (None if cfg["ema_decay"] is None
+                                       else float(cfg["ema_decay"]))},
+                        {"name": name, "kind": kind, "source": "sweep"})
+            winner = {"name": name, "kind": kind, "source": "sweep"}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"sweep artifact {sweep_path} is not usable: {exc}")
+    if all(k in env for k in ENV_CONFIG_KEYS):
+        ema_raw = env["FF_DDPM_EMA"]
+        config = {"ch": int(env["FF_DDPM_CH"]),
+                  "n_blocks": int(env["FF_DDPM_BLOCKS"]),
+                  "epochs": int(env["FF_DDPM_EPOCHS"]),
+                  "ema_decay": float(ema_raw) if ema_raw else None}
+        if winner is None:
+            winner = {"name": None, "kind": None, "source": "env"}
+        return config, winner
+    raise RuntimeError(
+        "no frozen DDPM config: run examples/sweep.py first or set "
+        "FF_DDPM_CH, FF_DDPM_BLOCKS, FF_DDPM_EPOCHS and FF_DDPM_EMA")
 
 
 def main():
     t0 = time.time()
     set_seed(SEED)
+    cfg, winner = resolve_ddpm_config()
+    if winner["name"] is not None:
+        print(f"sweep winner: {winner['name']} ({winner['kind']}, "
+              f"{winner['source']})")
+    else:
+        print("no sweep winner: explicit env config")
+    print(f"DDPM config: ch={cfg['ch']} blocks={cfg['n_blocks']} "
+          f"epochs={cfg['epochs']} ema={cfg['ema_decay']}")
     ds = load_dataset(os.path.abspath(DATA))
     print(f"data: {ds.n_chunks} chunks, {ds.n_seconds}s -> "
           f"{len(ds.train.x)}/{len(ds.val.x)}/{len(ds.test.x)} "
@@ -51,12 +104,12 @@ def main():
     vae = CondVAE()
     vae_hist = train_vae(vae, x_train, r_train, epochs=25, seed=SEED)
 
-    print(f"\n--- training DDPM ({count_params(BookDDPM(ch=DDPM_CH, n_blocks=DDPM_BLOCKS))} params, "
-          f"ch={DDPM_CH} blocks={DDPM_BLOCKS} epochs={DDPM_EPOCHS} ema={DDPM_EMA}) ---")
-    ddpm = BookDDPM(ch=DDPM_CH, n_blocks=DDPM_BLOCKS)
+    print(f"\n--- training DDPM ({count_params(BookDDPM(ch=cfg['ch'], n_blocks=cfg['n_blocks']))} params, "
+          f"ch={cfg['ch']} blocks={cfg['n_blocks']} epochs={cfg['epochs']} ema={cfg['ema_decay']}) ---")
+    ddpm = BookDDPM(ch=cfg["ch"], n_blocks=cfg["n_blocks"])
     ddpm_hist, ddpm_ema = train_ddpm(ddpm, x_train, r_train,
-                                     epochs=DDPM_EPOCHS, seed=SEED,
-                                     ema_decay=DDPM_EMA)
+                                     epochs=cfg["epochs"], seed=SEED,
+                                     ema_decay=cfg["ema_decay"])
 
     print("\n--- generating ---")
     vae.eval()
@@ -99,9 +152,11 @@ def main():
         "n_train": len(ds.train.x), "n_val": len(ds.val.x),
         "n_test": len(ds.test.x),
         "seconds": ds.n_seconds, "chunks": ds.n_chunks,
-        "ddpm_config": {"ch": DDPM_CH, "n_blocks": DDPM_BLOCKS,
-                        "epochs": DDPM_EPOCHS, "ema_decay": DDPM_EMA,
-                        "params": count_params(ddpm)},
+        "ddpm_config": {"ch": cfg["ch"], "n_blocks": cfg["n_blocks"],
+                        "epochs": cfg["epochs"], "ema_decay": cfg["ema_decay"],
+                        "params": count_params(ddpm),
+                        "source": winner["source"]},
+        "sweep_winner": winner,
         "vae": rep_vae, "ddpm": rep_ddpm,
         "vae_final_loss": vae_hist[-1], "ddpm_final_loss": ddpm_hist[-1],
         "train_minutes": (time.time() - t0) / 60,
