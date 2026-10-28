@@ -155,11 +155,14 @@ def test_large_gap_between_chunks_keeps_splits_populated(tmp_path):
 def test_overlapping_chunks_raise(tmp_path):
     # Overlapping sessions would let the same market seconds land in two
     # splits. That must fail loudly, never silently.
+    # Contract change (C02): overlapping raw sessions are now detected
+    # on raw quote time ranges before any chunk is dropped, raising
+    # ValueError instead of the old bar-range assert.
     import pytest
     t0 = 1_700_000_000_000
     d1 = _synth_chunk(tmp_path, "c1", n_sec=1200, t0_ms=t0, seed=0)
     d2 = _synth_chunk(tmp_path, "c2", n_sec=1200, t0_ms=t0 + 600_000, seed=1)
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="overlap"):
         build_dataset([d1, d2])
 
 
@@ -289,13 +292,16 @@ def test_write_manifest_and_dataset_card(tmp_path):
     assert mp.exists()
     assert manifest["n_chunks"] == 4
     assert len(manifest["chunks"]) == 4
-    assert all(len(c["sha16"]) == 16 for c in manifest["chunks"])
+    assert all(len(c["sha256"]) == 64 for c in manifest["chunks"])
+    assert all(c["quotes_sha256"] and c["trades_sha256"]
+               for c in manifest["chunks"])
     assert all(c["symbol"] == "BTCUSDT" for c in manifest["chunks"])
     assert all("seconds_missing" in c for c in manifest["chunks"])
     card = dataset_card(ds)
     assert "session-disjoint" in card.lower() or "Session-disjoint" in card
     assert "BTCUSDT" in card
     assert "Missingness" in card
+    assert "SHA256" in card
     for s in ("train", "val", "test"):
         assert s in card
 
@@ -316,7 +322,13 @@ def test_fewer_than_three_sessions_raises(tmp_path):
 def test_skipped_empty_chunk_keeps_hashes_aligned(tmp_path):
     # A chunk with no usable bars is skipped; the surviving chunk dirs,
     # hashes, symbols and stats must stay aligned with each other.
-    empty = _synth_chunk(tmp_path, "empty", n_sec=1, seed=9)
+    # Contract change (C02): the skipped chunk must NOT overlap the
+    # others. An overlapping chunk is a hard error even when its bars
+    # are dropped (see test_stage3_flowforge_02_overlapping_but_dropped_
+    # chunk_detected), so this fixture places the empty chunk in its
+    # own time range, well after the three kept sessions.
+    empty = _synth_chunk(tmp_path, "empty", n_sec=1, seed=9,
+                         t0_ms=1_700_000_000_000 + 20_000_000)
     dirs = _three_chunks(tmp_path)
     ds = build_dataset([empty] + dirs)
     assert ds.n_chunks == 3

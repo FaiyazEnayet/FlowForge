@@ -1,7 +1,12 @@
 __pycache__/
 *.pyc
 .venv/
-data/
+# The dataset NPZ stays gitignored, but the sanitized split manifest and
+# dataset card are committed (C02). The data/* form is required: a bare
+# negation under an ignored directory does not re-include the files.
+data/*
+!data/split_manifest.json
+!data/dataset_card.md
 runs/
 *.npz
 .DS_Store

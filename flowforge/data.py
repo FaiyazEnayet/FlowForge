@@ -42,6 +42,7 @@ Standardized with train statistics.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -67,6 +68,15 @@ LOOKBACK = 60        # seconds of past context for regime features
 TRAIN_FRAC = 0.70
 VAL_FRAC = 0.15
 # test gets the remainder (0.15)
+
+# Provenance versions (C02). Manifest schema v1 was the pre-C02 manifest:
+# truncated frame-buffer hashes, no canonical raw hashes, no validation.
+# Schema v2 records full SHA-256 of explicitly ordered raw file contents
+# plus the full record set below. DATA_TRANSFORM_VERSION is the first
+# versioned transform (introduced by C02); bump it if the bar/window
+# construction changes.
+MANIFEST_SCHEMA_VERSION = 2
+DATA_TRANSFORM_VERSION = 1
 
 
 @dataclass
@@ -94,6 +104,17 @@ class BookDataset:
     chunk_symbols: list = field(default_factory=list, repr=False)
     chunk_stats: list = field(default_factory=list, repr=False)
     session_split: dict = field(default_factory=dict, repr=False)
+    # C02 provenance: per-chunk canonical raw-file hashes, raw time
+    # ranges, and recorder metadata, aligned with chunk_dirs.
+    chunk_file_hashes: list = field(default_factory=list, repr=False)
+    chunk_time_ranges: list = field(default_factory=list, repr=False)
+    chunk_recorder_meta: list = field(default_factory=list, repr=False)
+    code_sha: str | None = None
+    manifest: dict | None = field(default=None, repr=False)
+    manifest_sha256: str | None = None
+    # True only for datasets built before the C02 manifest: they load
+    # only under explicit legacy=True and cannot publish new evidence.
+    legacy: bool = False
 
 
 def _load_chunk(chunk_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -102,13 +123,45 @@ def _load_chunk(chunk_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return q, t
 
 
-def _chunk_symbol(chunk_dir: str) -> str:
-    """Recording symbol from the chunk's meta.json, if present."""
+def _chunk_meta(chunk_dir: str) -> dict | None:
+    """Recording metadata from the chunk's meta.json, if present."""
     try:
         with open(os.path.join(chunk_dir, "meta.json")) as f:
-            return str(json.load(f).get("symbol", "unknown"))
+            meta = json.load(f)
     except (OSError, ValueError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _chunk_symbol(chunk_dir: str) -> str:
+    """Recording symbol from the chunk's meta.json, if present."""
+    meta = _chunk_meta(chunk_dir)
+    if meta is None:
         return "unknown"
+    return str(meta.get("symbol", "unknown"))
+
+
+def _sha256_file(path: str) -> str:
+    """Full SHA-256 of a file's raw bytes, streamed."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _canonical_json(obj) -> str:
+    """Canonical JSON for hashing: sorted keys, tight separators."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+
+
+def _day_from_ms(ms: int | None) -> str | None:
+    """UTC calendar day (YYYY-MM-DD) of a millisecond timestamp."""
+    if ms is None:
+        return None
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).date().isoformat()
 
 
 def _bars_from_chunk(q: pd.DataFrame, t: pd.DataFrame) -> pd.DataFrame:
@@ -181,7 +234,8 @@ def _windows_in_segment(seg: pd.DataFrame) -> list[tuple[int, int]]:
 
 
 def build_dataset(chunk_dirs: list[str],
-                  session_split: dict[str, list[int]] | None = None) -> BookDataset:
+                  session_split: dict[str, list[int]] | None = None,
+                  code_sha: str | None = None) -> BookDataset:
     """Load chunks, build 1s bars, split by session, emit standardized windows.
 
     Session-disjoint splits (FL3): whole recording sessions (chunks) are
@@ -191,8 +245,68 @@ def build_dataset(chunk_dirs: list[str],
     like {"train": [0,1,2,3,4], "val": [5], "test": [6,7]} to lock test
     session identities before sweeps. Chunk indices refer to chronological
     order. No raw second ever appears in two splits by construction.
+
+    Provenance (C02): chunk hashes are full SHA-256 of explicitly ordered
+    raw file bytes (quotes.parquet bytes, then trades.parquet bytes),
+    never parsed-frame bytes. Duplicate or overlapping raw sessions are
+    detected before any chunk is dropped, so a session whose bars are
+    later dropped cannot hide a duplicate. The returned dataset carries
+    its split manifest and manifest SHA; see build_manifest.
     """
-    import hashlib
+    # Raw-record checks run BEFORE any chunk is dropped, so a duplicated
+    # or overlapping session is detected even if its bars are later
+    # dropped. Hashes are full SHA-256 of raw file bytes in fixed order
+    # (quotes then trades), never parsed-frame bytes.
+    if len(chunk_dirs) != len(set(chunk_dirs)):
+        raise ValueError("duplicate chunk directory in chunk_dirs")
+
+    def _minmax(frame):
+        if len(frame) == 0:
+            return None, None
+        return int(frame["time"].min()), int(frame["time"].max())
+
+    raw_info = []
+    for d in chunk_dirs:
+        quotes_sha = _sha256_file(f"{d}/quotes.parquet")
+        trades_sha = _sha256_file(f"{d}/trades.parquet")
+        combined = hashlib.sha256()
+        for fname in ("quotes.parquet", "trades.parquet"):
+            with open(f"{d}/{fname}", "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    combined.update(block)
+        q, t = _load_chunk(d)
+        qmin, qmax = _minmax(q)
+        tmin, tmax = _minmax(t)
+        raw_info.append({
+            "dir": d, "q": q, "t": t,
+            "quotes_sha256": quotes_sha, "trades_sha256": trades_sha,
+            "sha256": combined.hexdigest(),
+            "quotes_t_min_ms": qmin, "quotes_t_max_ms": qmax,
+            "trades_t_min_ms": tmin, "trades_t_max_ms": tmax,
+            "day": _day_from_ms(qmin),
+            "meta": _chunk_meta(d), "symbol": _chunk_symbol(d),
+        })
+    seen_hash = {}
+    for info in raw_info:
+        if info["sha256"] in seen_hash:
+            raise ValueError(
+                f"duplicated raw session: {info['dir']} has identical raw "
+                f"bytes to {seen_hash[info['sha256']]}; deduplicate "
+                f"recording sessions")
+        seen_hash[info["sha256"]] = info["dir"]
+    for i, a in enumerate(raw_info):
+        if a["quotes_t_min_ms"] is None:
+            continue
+        for b in raw_info[i + 1:]:
+            if b["quotes_t_min_ms"] is None:
+                continue
+            if (a["quotes_t_min_ms"] <= b["quotes_t_max_ms"]
+                    and b["quotes_t_min_ms"] <= a["quotes_t_max_ms"]):
+                raise ValueError(
+                    f"overlapping raw sessions: {a['dir']} and {b['dir']} "
+                    f"share raw quote seconds; sort/deduplicate recording "
+                    f"sessions")
+
     # Parallel kept-lists: a chunk with no usable bars is skipped, and the
     # surviving entries stay aligned (dir <-> bars <-> hash <-> symbol).
     kept_dirs: list[str] = []
@@ -200,22 +314,33 @@ def build_dataset(chunk_dirs: list[str],
     kept_hashes: list[str] = []
     kept_symbols: list[str] = []
     kept_stats: list[dict] = []
-    for d in chunk_dirs:
-        q, t = _load_chunk(d)
-        # hash the raw inputs for the manifest
-        h = hashlib.sha256()
-        h.update(q.to_numpy().tobytes())
-        h.update(t.to_numpy().tobytes())
-        b = _bars_from_chunk(q, t)
+    kept_file_hashes: list[dict] = []
+    kept_time_ranges: list[dict] = []
+    kept_recorder_meta: list = []
+    for info in raw_info:
+        d = info["dir"]
+        b = _bars_from_chunk(info["q"], info["t"])
         if len(b) == 0:
             continue
         span = int(b.index.max() - b.index.min()) + 1
         kept_dirs.append(d)
         kept_bars.append(b)
-        kept_hashes.append(h.hexdigest()[:16])
-        kept_symbols.append(_chunk_symbol(d))
+        kept_hashes.append(info["sha256"])
+        kept_symbols.append(info["symbol"])
         kept_stats.append({"span": span, "usable": int(len(b)),
-                           "missing": span - int(len(b))})
+                           "missing": span - int(len(b)),
+                           "segments": len(_segments(b))})
+        kept_file_hashes.append({
+            "quotes_sha256": info["quotes_sha256"],
+            "trades_sha256": info["trades_sha256"],
+            "sha256": info["sha256"]})
+        kept_time_ranges.append({
+            "quotes_t_min_ms": info["quotes_t_min_ms"],
+            "quotes_t_max_ms": info["quotes_t_max_ms"],
+            "trades_t_min_ms": info["trades_t_min_ms"],
+            "trades_t_max_ms": info["trades_t_max_ms"],
+            "day": info["day"]})
+        kept_recorder_meta.append(info["meta"])
     if not kept_bars:
         raise ValueError("no usable bars in any chunk")
     n_seconds = int(sum(len(b) for b in kept_bars))
@@ -228,6 +353,9 @@ def build_dataset(chunk_dirs: list[str],
     ordered_hashes = [kept_hashes[i] for i in order]
     ordered_symbols = [kept_symbols[i] for i in order]
     ordered_stats = [kept_stats[i] for i in order]
+    ordered_file_hashes = [kept_file_hashes[i] for i in order]
+    ordered_time_ranges = [kept_time_ranges[i] for i in order]
+    ordered_recorder_meta = [kept_recorder_meta[i] for i in order]
     for prev, cur in zip(ordered[:-1], ordered[1:]):
         assert cur.index.min() > prev.index.max(), \
             "chunk time ranges overlap; sort/deduplicate recording sessions"
@@ -313,41 +441,110 @@ def build_dataset(chunk_dirs: list[str],
                             t_start=tt[:, 0], t_end=tt[:, 1],
                             session_ids=ss)
 
-    return BookDataset(
+    ds = BookDataset(
         train=pack("train"), val=pack("val"), test=pack("test"),
         feature_mean=f_mean, feature_std=f_std,
         regime_mean=r_mean, regime_std=r_std,
         n_seconds=n_seconds, n_chunks=len(ordered),
         chunk_dirs=ordered_dirs, chunk_hashes=ordered_hashes,
         chunk_symbols=ordered_symbols, chunk_stats=ordered_stats,
+        chunk_file_hashes=ordered_file_hashes,
+        chunk_time_ranges=ordered_time_ranges,
+        chunk_recorder_meta=ordered_recorder_meta,
+        code_sha=code_sha,
         session_split={k: list(v) for k, v in session_split.items()},
     )
+    ds.manifest = build_manifest(ds)
+    ds.manifest_sha256 = ds.manifest["manifest_sha256"]
+    return ds
 
 
-def write_manifest(ds: BookDataset, path: str) -> None:
+def manifest_sha256(manifest: dict) -> str:
+    """Canonical SHA-256 of a manifest's content.
+
+    The hash covers everything except the hash itself and the wall-clock
+    `created_utc`, so the same dataset built in separate processes (or
+    rewritten later) yields the identical hash.
+    """
+    content = {k: v for k, v in manifest.items()
+               if k not in ("manifest_sha256", "created_utc")}
+    return hashlib.sha256(_canonical_json(content).encode("utf-8")).hexdigest()
+
+
+def build_manifest(ds: BookDataset) -> dict:
+    """Build the split manifest: chunk identities, canonical raw hashes,
+    and the full provenance record.
+
+    The manifest is sanitized by construction: chunk directories are
+    recorded as basenames only, never absolute local paths, so the file
+    is safe to commit. Test session identities are fixed here before any
+    sweep; reruns with the same manifest reproduce the split.
+    """
+    from datetime import datetime, timezone
+
+    def _at(lst, i, key, default=None):
+        if i < len(lst) and isinstance(lst[i], dict):
+            return lst[i].get(key, default)
+        return default
+
+    chunks = []
+    for i, (d, h, sym, st) in enumerate(zip(
+            ds.chunk_dirs, ds.chunk_hashes, ds.chunk_symbols, ds.chunk_stats)):
+        meta = ds.chunk_recorder_meta[i] if i < len(ds.chunk_recorder_meta) else None
+        tr = ds.chunk_time_ranges[i] if i < len(ds.chunk_time_ranges) else {}
+        chunks.append({
+            "session_id": i,
+            "dir": os.path.basename(os.path.normpath(d)),
+            "symbol": sym,
+            "sha256": h,
+            "quotes_sha256": _at(ds.chunk_file_hashes, i, "quotes_sha256"),
+            "trades_sha256": _at(ds.chunk_file_hashes, i, "trades_sha256"),
+            "split": next(s for s, idxs in ds.session_split.items() if i in idxs),
+            "seconds_span": st["span"], "seconds_usable": st["usable"],
+            "seconds_missing": st["missing"],
+            "segments": st.get("segments"),
+            "quotes_t_min_ms": tr.get("quotes_t_min_ms"),
+            "quotes_t_max_ms": tr.get("quotes_t_max_ms"),
+            "trades_t_min_ms": tr.get("trades_t_min_ms"),
+            "trades_t_max_ms": tr.get("trades_t_max_ms"),
+            "day": tr.get("day"),
+            "recorder_meta": meta,
+            "recorder_schema_version": (meta.get("schema_version")
+                                        if isinstance(meta, dict) else None),
+        })
+    content = {
+        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "data_transform_version": DATA_TRANSFORM_VERSION,
+        # The dataset build is deterministic (no sampling): no random
+        # seed exists to record, so the field is present and null rather
+        # than omitted or invented.
+        "random_seed": None,
+        "deterministic": True,
+        "code_sha": ds.code_sha,
+        "n_chunks": ds.n_chunks,
+        "n_seconds": ds.n_seconds,
+        "chunks": chunks,
+        "session_split": {k: list(v) for k, v in ds.session_split.items()},
+        "windows": {s: int(getattr(ds, s).x.shape[0])
+                    for s in ("train", "val", "test")},
+    }
+    sha = hashlib.sha256(_canonical_json(content).encode("utf-8")).hexdigest()
+    return {"manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+            "manifest_sha256": sha,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            **content}
+
+
+def write_manifest(ds: BookDataset, path: str) -> dict:
     """Write the split manifest: chunk identities, hashes, and split assignment.
 
     This is the provenance record. Test session identities are fixed here
     before any sweep; reruns with the same manifest reproduce the split.
+    Writes the dataset's own manifest when it has one (so the file is
+    byte-identical to the manifest embedded in the NPZ); otherwise builds
+    one from the dataset fields.
     """
-    import json
-    from datetime import datetime, timezone
-    manifest = {
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "n_chunks": ds.n_chunks,
-        "n_seconds": ds.n_seconds,
-        "chunks": [
-            {"session_id": i, "dir": d, "symbol": sym, "sha16": h,
-             "split": next(s for s, idxs in ds.session_split.items() if i in idxs),
-             "seconds_span": st["span"], "seconds_usable": st["usable"],
-             "seconds_missing": st["missing"]}
-            for i, (d, h, sym, st) in enumerate(zip(
-                ds.chunk_dirs, ds.chunk_hashes, ds.chunk_symbols, ds.chunk_stats))
-        ],
-        "session_split": ds.session_split,
-        "windows": {s: int(getattr(ds, s).x.shape[0])
-                    for s in ("train", "val", "test")},
-    }
+    manifest = ds.manifest if ds.manifest is not None else build_manifest(ds)
     # Integrity check: no session appears in two splits.
     seen_sessions = {}
     for s in ("train", "val", "test"):
@@ -359,6 +556,163 @@ def write_manifest(ds: BookDataset, path: str) -> None:
     return manifest
 
 
+_MANIFEST_REQUIRED_TOP = ("manifest_schema_version", "manifest_sha256",
+                          "data_transform_version", "random_seed", "code_sha",
+                          "n_chunks", "n_seconds", "chunks", "session_split",
+                          "windows")
+_MANIFEST_REQUIRED_CHUNK = ("session_id", "dir", "symbol", "sha256",
+                            "quotes_sha256", "trades_sha256", "split",
+                            "seconds_span", "seconds_usable",
+                            "seconds_missing", "segments",
+                            "quotes_t_min_ms", "quotes_t_max_ms",
+                            "trades_t_min_ms", "trades_t_max_ms", "day",
+                            "recorder_meta", "recorder_schema_version")
+
+
+def validate_manifest(manifest: dict, chunk_dirs: list[str]) -> dict:
+    """Validate a split manifest against raw recording directories.
+
+    Recomputes every chunk's raw file hashes and raw timestamp
+    minima/maxima from the parquet files and compares them to the
+    manifest, and checks the manifest's own canonical hash, required
+    fields, and session coverage. Raises ValueError naming the chunk
+    and field on any missing or mismatching value. Returns the manifest
+    unchanged on success. This is the check to run before trusting a
+    manifest: it catches a manifest edited by hand, a manifest paired
+    with different recordings, and a manifest missing required fields.
+    """
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a JSON object")
+    for field in _MANIFEST_REQUIRED_TOP:
+        if field not in manifest:
+            raise ValueError(f"manifest missing required field {field!r}")
+    if manifest["manifest_schema_version"] != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"manifest schema version {manifest['manifest_schema_version']} "
+            f"is not current schema {MANIFEST_SCHEMA_VERSION}: manifests "
+            f"from before C02 (truncated frame-buffer hashes) cannot be "
+            f"validated; rebuild with examples/build_data.py")
+    if manifest_sha256(manifest) != manifest["manifest_sha256"]:
+        raise ValueError("manifest SHA mismatch: the manifest content does "
+                         "not hash to its recorded manifest_sha256; the "
+                         "manifest was edited or corrupted")
+    chunks = manifest["chunks"]
+    if len(chunks) != manifest["n_chunks"]:
+        raise ValueError(
+            f"manifest lists {len(chunks)} chunks but n_chunks is "
+            f"{manifest['n_chunks']}")
+    split = manifest["session_split"]
+    if set(split.keys()) != {"train", "val", "test"}:
+        raise ValueError("session_split must have exactly train/val/test")
+    seen = []
+    for name in ("train", "val", "test"):
+        seen.extend(split[name])
+    if sorted(seen) != list(range(manifest["n_chunks"])):
+        raise ValueError("session_split must assign each chunk exactly once")
+    by_base: dict[str, list[str]] = {}
+    for d in chunk_dirs:
+        by_base.setdefault(os.path.basename(os.path.normpath(d)), []).append(d)
+    sids = set()
+    for c in chunks:
+        for field in _MANIFEST_REQUIRED_CHUNK:
+            if field not in c:
+                raise ValueError(
+                    f"chunk {c.get('session_id')}: manifest missing required "
+                    f"field {field!r}")
+        sid = c["session_id"]
+        if sid in sids:
+            raise ValueError(f"duplicate session_id {sid} in manifest")
+        sids.add(sid)
+        base = c["dir"]
+        cands = by_base.get(base, [])
+        if not cands:
+            raise ValueError(
+                f"chunk {sid} ({base}): recording directory not found "
+                f"among the supplied chunk directories")
+        if len(cands) > 1:
+            raise ValueError(
+                f"chunk {sid} ({base}): ambiguous recording directory "
+                f"(multiple supplied dirs share the basename)")
+        d = cands[0]
+        for fname, key in (("quotes.parquet", "quotes_sha256"),
+                           ("trades.parquet", "trades_sha256")):
+            p = os.path.join(d, fname)
+            if not os.path.exists(p):
+                raise ValueError(
+                    f"chunk {sid} ({base}): missing file {fname}")
+            h = _sha256_file(p)
+            if h != c[key]:
+                raise ValueError(
+                    f"chunk {sid} ({base}): {key} mismatch: manifest "
+                    f"records {c[key]}, recomputed {h}")
+        q, t = _load_chunk(d)
+
+        def _minmax(frame):
+            if len(frame) == 0:
+                return None, None
+            return int(frame["time"].min()), int(frame["time"].max())
+
+        qmin, qmax = _minmax(q)
+        tmin, tmax = _minmax(t)
+        for label, got, want in (
+                ("quotes_t_min_ms", qmin, c["quotes_t_min_ms"]),
+                ("quotes_t_max_ms", qmax, c["quotes_t_max_ms"]),
+                ("trades_t_min_ms", tmin, c["trades_t_min_ms"]),
+                ("trades_t_max_ms", tmax, c["trades_t_max_ms"])):
+            if got != want:
+                raise ValueError(
+                    f"chunk {sid} ({base}): {label} mismatch: manifest "
+                    f"records {want}, recomputed {got}")
+    if sids != set(range(manifest["n_chunks"])):
+        raise ValueError("manifest chunk session_ids do not cover "
+                         "0..n_chunks-1 exactly once")
+    return manifest
+
+
+def check_manifest_file(ds: BookDataset, path: str) -> bool:
+    """Cross-check a dataset against a split-manifest file on disk.
+
+    Returns False when the file is absent (the caller may proceed on the
+    NPZ-embedded manifest alone). Raises ValueError when the file exists
+    but its recorded SHA or its content hash does not match the
+    dataset's manifest SHA: a failed match must abort before training,
+    never warn-and-continue.
+    """
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        manifest = json.load(f)
+    if ds.manifest_sha256 is None:
+        raise ValueError("dataset carries no split-manifest SHA; it was "
+                         "built before C02 or loaded in legacy mode")
+    if manifest.get("manifest_sha256") != ds.manifest_sha256:
+        raise ValueError(
+            f"split-manifest SHA mismatch: manifest file records "
+            f"{manifest.get('manifest_sha256')}, dataset records "
+            f"{ds.manifest_sha256}; the NPZ and the manifest do not belong "
+            f"together")
+    if manifest_sha256(manifest) != ds.manifest_sha256:
+        raise ValueError("split-manifest content hash mismatch: the "
+                         "manifest file content does not hash to the "
+                         "dataset's manifest SHA")
+    return True
+
+
+def ensure_publishable(ds: BookDataset) -> None:
+    """Refuse benchmark evidence from a legacy dataset.
+
+    A dataset loaded in legacy mode (no C02 split manifest) may be
+    inspected, but it cannot publish new benchmark evidence: metrics,
+    sweep, or bundle artifacts built from it would claim provenance the
+    dataset cannot back. Raises RuntimeError for legacy datasets.
+    """
+    if ds.legacy:
+        raise RuntimeError(
+            "legacy dataset (no C02 split manifest): cannot publish new "
+            "benchmark evidence; rebuild the dataset with "
+            "examples/build_data.py first")
+
+
 def dataset_card(ds: BookDataset) -> str:
     """Markdown dataset card: sessions, hours, symbols, missingness."""
     lines = ["# Dataset card: book-state windows", ""]
@@ -367,6 +721,10 @@ def dataset_card(ds: BookDataset) -> str:
                  f"({ds.n_seconds / 3600:.2f} hours)")
     symbols = sorted(set(ds.chunk_symbols)) if ds.chunk_symbols else ["unknown"]
     lines.append(f"- Symbols: {', '.join(symbols)}")
+    lines.append(f"- Manifest schema: {MANIFEST_SCHEMA_VERSION}")
+    lines.append(f"- Manifest SHA-256: "
+                 f"{ds.manifest_sha256 or 'none (built before C02)'}")
+    lines.append(f"- Data transform version: {DATA_TRANSFORM_VERSION}")
     if ds.chunk_stats:
         total_span = sum(s["span"] for s in ds.chunk_stats)
         total_missing = sum(s["missing"] for s in ds.chunk_stats)
@@ -385,14 +743,15 @@ def dataset_card(ds: BookDataset) -> str:
     lines.append("")
     lines.append("## Sessions")
     lines.append("")
-    lines.append("| ID | Directory | Symbol | SHA16 | Split | Span (s) | "
+    lines.append("| ID | Directory | Symbol | SHA256 | Split | Span (s) | "
                  "Usable (s) | Missing (s) |")
     lines.append("|----|-----------|--------|-------|-------|----------|"
                  "------------|-------------|")
     for i, (d, sym, h, st) in enumerate(zip(
             ds.chunk_dirs, ds.chunk_symbols, ds.chunk_hashes, ds.chunk_stats)):
         split = next(s for s, idxs in ds.session_split.items() if i in idxs)
-        lines.append(f"| {i} | {d} | {sym} | {h} | {split} | {st['span']} | "
+        lines.append(f"| {i} | {os.path.basename(os.path.normpath(d))} | "
+                     f"{sym} | {h} | {split} | {st['span']} | "
                      f"{st['usable']} | {st['missing']} |")
     lines.append("")
     lines.append("## Notes")
@@ -406,6 +765,19 @@ def dataset_card(ds: BookDataset) -> str:
 
 def save_dataset(ds: BookDataset, path: str) -> None:
     import json
+    # The split manifest travels inside the NPZ so the artifact is
+    # self-describing: the manifest SHA recorded here is what metrics,
+    # sweep, and bundle artifacts cite. A dataset without a manifest
+    # (built by hand, not by build_dataset) saves without provenance and
+    # loads only in explicit legacy mode.
+    extra = {}
+    if ds.manifest is not None:
+        extra["manifest_json"] = np.array(json.dumps(ds.manifest))
+    if ds.manifest_sha256 is not None:
+        extra["manifest_sha256"] = np.array(ds.manifest_sha256)
+    extra["chunk_file_hashes_json"] = np.array(json.dumps(ds.chunk_file_hashes))
+    extra["chunk_time_ranges_json"] = np.array(json.dumps(ds.chunk_time_ranges))
+    extra["chunk_recorder_meta_json"] = np.array(json.dumps(ds.chunk_recorder_meta))
     np.savez_compressed(
         path,
         **{f"{s}_{k}": getattr(getattr(ds, s), k)
@@ -419,17 +791,53 @@ def save_dataset(ds: BookDataset, path: str) -> None:
         chunk_symbols=np.array(ds.chunk_symbols, dtype=object),
         chunk_stats_json=np.array(json.dumps(ds.chunk_stats)),
         session_split_json=np.array(json.dumps(ds.session_split)),
+        **extra,
     )
 
 
-def load_dataset(path: str) -> BookDataset:
+def load_dataset(path: str, legacy: bool = False) -> BookDataset:
+    """Load a dataset NPZ.
+
+    Datasets built before the C02 split manifest carry no manifest SHA
+    and load only with explicit legacy=True; the loaded dataset is
+    flagged legacy and cannot publish new benchmark evidence (see
+    ensure_publishable). Session IDs are never silently filled with -1:
+    a manifest-carrying file with session_ids stripped is corrupt and
+    fails even in legacy mode, because the manifest claims session
+    coverage the arrays cannot back.
+    """
     import json
     z = np.load(path, allow_pickle=True)
+    has_manifest = "manifest_json" in z and "manifest_sha256" in z
+    if not has_manifest and not legacy:
+        raise ValueError(
+            "dataset was built before the C02 split manifest (no "
+            "manifest SHA in the NPZ): rerun examples/build_data.py to "
+            "rebuild it with provenance, or load with legacy=True for "
+            "inspection only (legacy datasets cannot publish new "
+            "benchmark evidence)")
+    manifest = None
+    msha = None
+    if has_manifest:
+        manifest = json.loads(str(z["manifest_json"]))
+        msha = str(z["manifest_sha256"])
+        if (manifest_sha256(manifest) != msha
+                or manifest.get("manifest_sha256") != msha):
+            raise ValueError(
+                "embedded split-manifest SHA mismatch: the NPZ manifest "
+                "content does not hash to its recorded manifest SHA; "
+                "the artifact was edited or corrupted")
 
     def unpack(s: str) -> SplitWindows:
-        # session_ids may be absent in datasets built before FL3.
+        # session_ids may be absent in datasets built before FL3, but
+        # only in legacy mode: a manifest-carrying file without them is
+        # corrupt, and -1 identities are never constructed silently.
         if f"{s}_session_ids" in z:
             ss = z[f"{s}_session_ids"]
+        elif has_manifest:
+            raise ValueError(
+                f"dataset manifest present but {s} session_ids missing: "
+                f"corrupt artifact, refusing to invent -1 session identities")
         else:
             ss = np.full(z[f"{s}_x"].shape[0], -1, dtype=np.int64)
         return SplitWindows(x=z[f"{s}_x"], regime=z[f"{s}_regime"],
@@ -438,6 +846,9 @@ def load_dataset(path: str) -> BookDataset:
 
     def _str_list(key):
         return [str(x) for x in z[key].tolist()] if key in z else []
+
+    def _json_list(key):
+        return json.loads(str(z[key])) if key in z else []
 
     split = json.loads(str(z["session_split_json"])) if "session_split_json" in z else {}
     stats = json.loads(str(z["chunk_stats_json"])) if "chunk_stats_json" in z else []
@@ -450,5 +861,12 @@ def load_dataset(path: str) -> BookDataset:
         chunk_hashes=_str_list("chunk_hashes"),
         chunk_symbols=_str_list("chunk_symbols"),
         chunk_stats=stats,
+        chunk_file_hashes=_json_list("chunk_file_hashes_json"),
+        chunk_time_ranges=_json_list("chunk_time_ranges_json"),
+        chunk_recorder_meta=_json_list("chunk_recorder_meta_json"),
+        code_sha=manifest.get("code_sha") if manifest else None,
+        manifest=manifest,
+        manifest_sha256=msha,
         session_split=split,
+        legacy=not has_manifest,
     )

@@ -11,7 +11,10 @@ runs/metrics.json.
 
 Provenance (FL7): the bundle records SHA256 hashes of its inputs
 (eval_arrays.npz, metrics.json) and the effective config, so the bundle
-can be traced back to the exact run that produced it. See REPRODUCE.md
+can be traced back to the exact run that produced it. Since C02 it also
+records the split-manifest SHA from runs/metrics.json, and refuses to
+build when that SHA is absent: a bundle cannot claim provenance if its
+upstream artifacts are missing or changed. See REPRODUCE.md
 for the full pipeline from raw recordings to this bundle.
 """
 
@@ -41,6 +44,22 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def require_split_manifest_sha(metrics):
+    """Split-manifest SHA a demo bundle's provenance must cite.
+
+    Raises ValueError when runs/metrics.json carries no split-manifest
+    SHA: the bundle cannot claim provenance if its upstream artifacts
+    are missing. Rebuild metrics with examples/demo.py (C02) first.
+    """
+    sha = metrics.get("split_manifest_sha256")
+    if not isinstance(sha, str) or not sha:
+        raise ValueError(
+            "runs/metrics.json carries no split-manifest SHA: rebuild "
+            "metrics with examples/demo.py first; the demo bundle cannot "
+            "claim provenance without the manifest chain")
+    return sha
+
+
 def main():
     rng = np.random.default_rng(SEED)
     z = np.load(os.path.join(RUNS, "eval_arrays.npz"))
@@ -58,6 +77,7 @@ def main():
         metrics = json.load(f)
     ddpm = metrics["ddpm"]
     vae = metrics["vae"]
+    manifest_sha = require_split_manifest_sha(metrics)
 
     os.makedirs(DEMO, exist_ok=True)
     np.savez_compressed(
@@ -96,7 +116,10 @@ def main():
         # FL7 provenance: hashes of the exact inputs that produced this
         # bundle, plus the effective config. The bundle is reproducible
         # from these inputs with seed 7; see REPRODUCE.md.
+        # C02 adds the split-manifest SHA, chaining the bundle back to
+        # the raw recordings through runs/metrics.json.
         "provenance": {
+            "split_manifest_sha256": manifest_sha,
             "eval_arrays_sha256": _sha256_file(
                 os.path.join(RUNS, "eval_arrays.npz")),
             "metrics_sha256": _sha256_file(

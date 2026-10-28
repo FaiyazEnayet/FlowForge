@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+### Added
+- Canonical dataset hashes and locked split manifests (`flowforge/data.py`, `examples/build_data.py`, `examples/demo.py`, `examples/sweep.py`, `examples/build_demo.py`): chunk hashes are now full SHA-256 of explicitly ordered raw file bytes (quotes.parquet bytes, then trades.parquet bytes) instead of truncated parsed-frame bytes. The split manifest (schema v2) records per-chunk raw file hashes, raw timestamp minima/maxima, symbol, recorder metadata and schema version, session ID, UTC day, split, usable-bar count, segment count, data transform version, random seed (null: the build is deterministic), and code SHA, plus a canonical manifest SHA that excludes only the hash itself and the wall-clock creation time, so identical raw bytes in separate processes yield identical hashes. Duplicate or overlapping raw sessions are detected before any chunk is dropped, so a session whose bars are later dropped cannot hide a duplicate. The manifest SHA is saved inside the NPZ and recorded in `runs/metrics.json`, `runs/sweep.json`, and the demo bundle provenance; demo and sweep validate the manifest file on disk against the NPZ before training and abort on mismatch, and the demo bundle refuses to build when upstream metrics carry no manifest SHA. Datasets built before this manifest load only with explicit `legacy=True`, are flagged legacy, and cannot publish new benchmark evidence. The sanitized manifest (`data/split_manifest.json`, basenames only, no local paths) and dataset card (`data/dataset_card.md`) are now committed; the dataset NPZ stays gitignored.
 ### Docs
 - Centered the README header: uniform dark badge labels and three action buttons in the dashboard palette (Open Demo, Explore Method, Run Locally).
 ### Fixed
