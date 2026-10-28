@@ -20,7 +20,10 @@ import torch
 from flowforge import checkpoints
 from flowforge.models import EMA, BookDDPM, CondVAE
 
-VENV_PY = "/home/hatch/workspace/flowforge/.venv/bin/python"
+# Subprocess interpreter: the interpreter running pytest, so the
+# fresh-process test works in CI as well as locally. A hardcoded venv
+# path would not exist on the CI runner.
+VENV_PY = sys.executable
 
 TINY_DDPM = {"n_features": 5, "window": 8, "t_steps": 10, "ch": 8,
               "n_blocks": 1}
