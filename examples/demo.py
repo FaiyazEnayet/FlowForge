@@ -16,12 +16,13 @@ import time
 import numpy as np
 import torch
 
-from flowforge.data import (check_manifest_file, ensure_publishable,
-                            load_dataset)
+from flowforge.checkpoints import save_inference_checkpoint
+from flowforge.data import (N_FEATURES, WINDOW, check_manifest_file,
+                            ensure_publishable, load_dataset)
 from flowforge.evaluate import full_report, print_report
-from flowforge.models import (BookDDPM, CondVAE, count_params,
-                              sample_with_ema, set_seed, train_ddpm,
-                              train_vae)
+from flowforge.models import (LATENT_DIM, REGIME_DIM, BookDDPM, CondVAE,
+                              count_params, sample_with_ema, set_seed,
+                              train_ddpm, train_vae)
 
 SEED = 7
 DATA = os.path.join(os.path.dirname(__file__), "..", "data", "book_windows.npz")
@@ -123,6 +124,30 @@ def main():
                                      epochs=cfg["epochs"], seed=SEED,
                                      ema_decay=cfg["ema_decay"])
 
+    print("\n--- saving inference checkpoints ---")
+    normalizer = {
+        "feature_mean": ds.feature_mean.tolist(),
+        "feature_std": ds.feature_std.tolist(),
+        "regime_mean": ds.regime_mean.tolist(),
+        "regime_std": ds.regime_std.tolist(),
+    }
+    ckpt_root = os.path.join(RUNS, "checkpoints")
+    vae_manifest = save_inference_checkpoint(
+        os.path.join(ckpt_root, "vae"), vae, "CondVAE",
+        {"latent_dim": LATENT_DIM, "n_features": N_FEATURES,
+         "window": WINDOW, "regime_dim": REGIME_DIM},
+        normalizer, split_manifest_sha256=ds.manifest_sha256,
+        overwrite=True)
+    ddpm_manifest = save_inference_checkpoint(
+        os.path.join(ckpt_root, "ddpm"), ddpm, "BookDDPM",
+        {"n_features": N_FEATURES, "window": WINDOW, "t_steps": 100,
+         "beta_start": 1e-4, "beta_end": 0.08, "ch": cfg["ch"],
+         "n_blocks": cfg["n_blocks"]},
+        normalizer, split_manifest_sha256=ds.manifest_sha256,
+        ema=ddpm_ema, overwrite=True)
+    print(f"checkpoints -> {ckpt_root} (vae {vae_manifest['weights_source']}, "
+          f"ddpm {ddpm_manifest['weights_source']})")
+
     print("\n--- generating ---")
     vae.eval()
     r_val = torch.from_numpy(ds.val.regime)
@@ -171,6 +196,14 @@ def main():
                         "params": count_params(ddpm),
                         "source": winner["source"]},
         "sweep_winner": winner,
+        "checkpoints": {
+            "vae": {"path": "runs/checkpoints/vae",
+                    "manifest_sha256": vae_manifest["manifest_sha256"],
+                    "weights_source": vae_manifest["weights_source"]},
+            "ddpm": {"path": "runs/checkpoints/ddpm",
+                     "manifest_sha256": ddpm_manifest["manifest_sha256"],
+                     "weights_source": ddpm_manifest["weights_source"]},
+        },
         "vae": rep_vae, "ddpm": rep_ddpm,
         "vae_final_loss": vae_hist[-1], "ddpm_final_loss": ddpm_hist[-1],
         "train_minutes": (time.time() - t0) / 60,
