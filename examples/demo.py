@@ -16,7 +16,8 @@ import time
 import numpy as np
 import torch
 
-from flowforge.checkpoints import save_inference_checkpoint
+from flowforge.checkpoints import (load_checkpoint,
+                                   save_inference_checkpoint)
 from flowforge.data import (N_FEATURES, WINDOW, check_manifest_file,
                             ensure_publishable, load_dataset)
 from flowforge.evaluate import full_report, print_report
@@ -80,6 +81,21 @@ def resolve_ddpm_config(sweep_path=None, env=None):
     raise RuntimeError(
         "no frozen DDPM config: run examples/sweep.py first or set "
         "FF_DDPM_CH, FF_DDPM_BLOCKS, FF_DDPM_EPOCHS and FF_DDPM_EMA")
+
+
+def audit_saved_checkpoints(ckpt_root):
+    """Reload the saved inference checkpoints as a checksum audit.
+
+    load_checkpoint verifies the manifest digest and the weights SHA-256
+    before building the model, so a checkpoint altered after saving
+    raises ValueError here and aborts the run instead of passing
+    silently. Returns {name: manifest} for the audited checkpoints.
+    """
+    audited = {}
+    for name in ("vae", "ddpm"):
+        _, manifest = load_checkpoint(os.path.join(ckpt_root, name))
+        audited[name] = manifest
+    return audited
 
 
 def main():
@@ -147,22 +163,28 @@ def main():
         ema=ddpm_ema, overwrite=True)
     print(f"checkpoints -> {ckpt_root} (vae {vae_manifest['weights_source']}, "
           f"ddpm {ddpm_manifest['weights_source']})")
+    audit_saved_checkpoints(ckpt_root)
+    print("checkpoint audit: manifest and weights digests verified "
+          "(vae, ddpm)")
 
     print("\n--- generating ---")
     vae.eval()
     r_val = torch.from_numpy(ds.val.regime)
     r_test = torch.from_numpy(ds.test.regime)
-    with torch.no_grad():
+    with torch.inference_mode():
         gen_val_vae = vae.generate(r_val).numpy()
         gen_test_vae = vae.generate(r_test).numpy()
     if ddpm_ema is not None:
         gen_val_ddpm = sample_with_ema(ddpm, ddpm_ema, r_val,
-                                       seed=SEED).numpy()
+                                       seed=SEED, batch_size=32).numpy()
         gen_test_ddpm = sample_with_ema(ddpm, ddpm_ema, r_test,
-                                        seed=SEED + 1).numpy()
+                                        seed=SEED + 1,
+                                        batch_size=32).numpy()
     else:
-        gen_val_ddpm = ddpm.sample(r_val, seed=SEED).numpy()
-        gen_test_ddpm = ddpm.sample(r_test, seed=SEED + 1).numpy()
+        gen_val_ddpm = ddpm.sample(r_val, seed=SEED,
+                                   batch_size=32).numpy()
+        gen_test_ddpm = ddpm.sample(r_test, seed=SEED + 1,
+                                    batch_size=32).numpy()
 
     print("\n########## VAE baseline ##########")
     rep_vae = full_report(ds.test.x, gen_test_vae, ds.val.x, gen_val_vae,

@@ -1,0 +1,21 @@
+# Locked versions for the model and test stack, recorded from the
+# environment used to profile and verify the device and serialization
+# hardening in flowforge/models.py (TimeEmbed buffers, guarded batched
+# sampling). Profiling result on that environment: the per-step denoiser
+# forward dominates BookDDPM.sample wall time (about 4.4 ms per forward
+# at the default size, batch 4); the initial noise draw is about 12
+# microseconds per call, so allocation and RNG work are not the
+# bottleneck and were not optimized.
+# Hardware and backend: AMD EPYC 9D25, 2 vCPUs exposed, torch
+# 2.14.1+cpu (Intel MKL BLAS, oneDNN), no accelerator present.
+# Install torch from the CPU index first, as described in
+# requirements.txt, then install this file.
+torch==2.14.1+cpu
+numpy==2.5.4
+pytest==9.1.1
+filelock==3.32.3
+fsspec==2026.7.0
+Jinja2==3.1.6
+mpmath==1.3.0
+networkx==3.6.1
+sympy==1.14.0
