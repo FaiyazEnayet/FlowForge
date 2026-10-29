@@ -201,12 +201,21 @@ class TimeEmbed(nn.Module):
     def __init__(self, dim: int = 64):
         super().__init__()
         self.dim = dim
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(10000)
+            * torch.arange(half, dtype=torch.float32) / half)
+        # A buffer, so the frequencies follow .to(), .cuda(), .float(),
+        # and .double() moves of the module instead of being rebuilt on
+        # CPU in forward (which broke device placement with a device
+        # mismatch). Non-persistent: the values are a deterministic
+        # function of dim, so they stay out of state dicts and existing
+        # checkpoints keep their exact key set.
+        self.register_buffer("freqs", freqs, persistent=False)
         self.mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half = self.dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
-        args = t.float().unsqueeze(1) * freqs.unsqueeze(0)
+        args = t.float().unsqueeze(1) * self.freqs.unsqueeze(0)
         return self.mlp(torch.cat([torch.sin(args), torch.cos(args)], dim=1))
 
 
@@ -310,7 +319,8 @@ class BookDDPM(nn.Module):
     @torch.no_grad()
     def sample(self, regime, seed: int = 0,
                generator: torch.Generator | None = None,
-               run_id: str | None = None):
+               run_id: str | None = None,
+               batch_size: int | None = None):
         """Sample the reverse chain from an isolated stream.
 
         With ``generator`` the chain draws from it; otherwise a fresh
@@ -319,11 +329,52 @@ class BookDDPM(nn.Module):
         unlike the previous implementation which reset it via set_seed.
         A fresh generator seeded identically reproduces the old draw
         sequence, so fixed-seed outputs are unchanged.
+
+        The chain runs under torch.inference_mode. ``batch_size`` chunks
+        the regime rows into explicit batches, drawn from the same
+        generator in row order; a batched call is reproducible for a
+        fixed seed and batch size, but chunking changes the draw
+        blocking, so batched values differ from the unbatched stream.
+        The default unbatched path keeps the exact pre-existing draw
+        sequence and outputs.
+
+        Failed inputs are rejected instead of sampled from: a non-tensor,
+        mis-shaped, empty, or non-finite regime raises ValueError, as
+        does a non-positive batch_size. After every reverse step the
+        chain state is checked and a non-finite value raises
+        FloatingPointError naming the step, instead of silently
+        returning non-finite windows.
         """
+        if not isinstance(regime, torch.Tensor):
+            raise ValueError("regime must be a torch.Tensor")
+        want = self.net.regime_mlp[0].in_features
+        if regime.ndim != 2 or regime.shape[1] != want:
+            raise ValueError(
+                f"regime must have shape (batch, {want}), "
+                f"got {tuple(regime.shape)}")
+        if regime.shape[0] == 0:
+            raise ValueError("regime batch is empty")
+        if not bool(torch.isfinite(regime).all()):
+            raise ValueError("regime contains non-finite values")
+        if batch_size is not None and (
+                not isinstance(batch_size, int) or batch_size < 1):
+            raise ValueError("batch_size must be a positive int or None")
         if generator is None:
             if run_id is not None:
                 seed = derive_seed(run_id, "bookddpm:sample")
             generator = make_generator(seed, device=regime.device)
+        step = batch_size if batch_size is not None else regime.shape[0]
+        parts = []
+        with torch.inference_mode():
+            for start in range(0, regime.shape[0], step):
+                parts.append(self._sample_rows(
+                    regime[start:start + step], generator))
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=0)
+
+    def _sample_rows(self, regime, generator):
+        """One reverse chain for a single chunk of regime rows."""
         b = regime.shape[0]
         dev = regime.device
         x = torch.randn(b, self.n_features, self.window, device=dev,
@@ -339,6 +390,10 @@ class BookDDPM(nn.Module):
             if i > 0:
                 x = x + torch.sqrt(betas[i]) * torch.randn_like(
                     x, generator=generator)
+            if not bool(torch.isfinite(x).all()):
+                raise FloatingPointError(
+                    f"sample produced non-finite values at "
+                    f"reverse step {i}")
         return x.permute(0, 2, 1)  # (B, L, F)
 
 
@@ -381,12 +436,13 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
 def sample_with_ema(model: BookDDPM, ema: EMA, regime: torch.Tensor,
                     seed: int = 0,
                     generator: torch.Generator | None = None,
-                    run_id: str | None = None) -> torch.Tensor:
+                    run_id: str | None = None,
+                    batch_size: int | None = None) -> torch.Tensor:
     """Sample from EMA weights, then restore the training weights."""
     ema.apply_to(model)
     try:
         return model.sample(regime, seed=seed, generator=generator,
-                            run_id=run_id)
+                            run_id=run_id, batch_size=batch_size)
     finally:
         ema.restore(model)
 
