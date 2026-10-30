@@ -60,7 +60,9 @@ def load_demo_bundle(bundle_path: str = DEFAULT_BUNDLE,
             f"under demo/; did you clone the full repository?")
     if not os.path.exists(metrics_path):
         raise FileNotFoundError(f"demo metrics not found: {metrics_path}")
-    z = np.load(bundle_path, allow_pickle=True)
+    # FF-N03: the committed bundle contains no object arrays, so it
+    # loads with pickle disabled like every other NPZ reader.
+    z = np.load(bundle_path, allow_pickle=False)
     missing = [k for k in REQUIRED_KEYS if k not in z]
     if missing:
         raise ValueError(f"demo bundle {bundle_path} missing keys: {missing}")

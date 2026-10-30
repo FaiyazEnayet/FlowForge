@@ -770,6 +770,10 @@ def save_dataset(ds: BookDataset, path: str) -> None:
     # sweep, and bundle artifacts cite. A dataset without a manifest
     # (built by hand, not by build_dataset) saves without provenance and
     # loads only in explicit legacy mode.
+    #
+    # FF-N03: chunk metadata is stored as typed UTF-8 JSON, never as
+    # NumPy object arrays, so the artifact contains nothing that needs
+    # pickle to read back and the default loader can stay pickle-free.
     extra = {}
     if ds.manifest is not None:
         extra["manifest_json"] = np.array(json.dumps(ds.manifest))
@@ -786,29 +790,58 @@ def save_dataset(ds: BookDataset, path: str) -> None:
         feature_mean=ds.feature_mean, feature_std=ds.feature_std,
         regime_mean=ds.regime_mean, regime_std=ds.regime_std,
         n_seconds=np.array(ds.n_seconds), n_chunks=np.array(ds.n_chunks),
-        chunk_dirs=np.array(ds.chunk_dirs, dtype=object),
-        chunk_hashes=np.array(ds.chunk_hashes, dtype=object),
-        chunk_symbols=np.array(ds.chunk_symbols, dtype=object),
+        chunk_dirs_json=np.array(json.dumps(ds.chunk_dirs)),
+        chunk_hashes_json=np.array(json.dumps(ds.chunk_hashes)),
+        chunk_symbols_json=np.array(json.dumps(ds.chunk_symbols)),
         chunk_stats_json=np.array(json.dumps(ds.chunk_stats)),
         session_split_json=np.array(json.dumps(ds.session_split)),
         **extra,
     )
 
 
+_TYPED_META_KEYS = ("chunk_dirs_json", "chunk_hashes_json",
+                    "chunk_symbols_json")
+_OBJECT_META_KEYS = ("chunk_dirs", "chunk_hashes", "chunk_symbols")
+
+
 def load_dataset(path: str, legacy: bool = False) -> BookDataset:
     """Load a dataset NPZ.
 
-    Datasets built before the C02 split manifest carry no manifest SHA
-    and load only with explicit legacy=True; the loaded dataset is
-    flagged legacy and cannot publish new benchmark evidence (see
-    ensure_publishable). Session IDs are never silently filled with -1:
-    a manifest-carrying file with session_ids stripped is corrupt and
-    fails even in legacy mode, because the manifest claims session
-    coverage the arrays cannot back.
+    The default loader is pickle-free (FF-N03): it opens the archive
+    with allow_pickle=False and validates dtypes, finiteness, and split
+    identity against the dataset's own embedded manifest (window
+    counts, per-split session membership, session_split agreement).
+    Archives in the pre-FF-N03 layout (chunk metadata stored as object
+    arrays) and datasets built before the C02 split manifest load only
+    with explicit legacy=True, which routes to the trusted reader; the
+    loaded dataset is flagged legacy and cannot publish new benchmark
+    evidence (see ensure_publishable). Session IDs are never silently
+    filled with -1: a manifest-carrying file with session_ids stripped
+    is corrupt and fails even in legacy mode, because the manifest
+    claims session coverage the arrays cannot back. Use
+    convert_legacy_dataset to migrate a trusted legacy archive to the
+    typed format.
     """
-    import json
-    z = np.load(path, allow_pickle=True)
-    has_manifest = "manifest_json" in z and "manifest_sha256" in z
+    with np.load(path, allow_pickle=False) as z:
+        keys = set(z.files)
+    has_manifest = "manifest_json" in keys and "manifest_sha256" in keys
+    if has_manifest:
+        missing = [s for s in ("train", "val", "test")
+                   if f"{s}_session_ids" not in keys]
+        if missing:
+            raise ValueError(
+                f"dataset manifest present but session_ids missing for "
+                f"{missing}: corrupt artifact, refusing to invent -1 "
+                f"session identities")
+    object_meta = [k for k in _OBJECT_META_KEYS if k in keys]
+    if object_meta and not legacy:
+        raise ValueError(
+            f"dataset NPZ stores {object_meta} as pickled object arrays "
+            f"(pre-FF-N03 legacy format): the default loader never "
+            f"evaluates pickle; convert the archive with "
+            f"flowforge.data.convert_legacy_dataset, or load with "
+            f"legacy=True for inspection only (legacy datasets cannot "
+            f"publish new benchmark evidence)")
     if not has_manifest and not legacy:
         raise ValueError(
             "dataset was built before the C02 split manifest (no "
@@ -816,6 +849,149 @@ def load_dataset(path: str, legacy: bool = False) -> BookDataset:
             "rebuild it with provenance, or load with legacy=True for "
             "inspection only (legacy datasets cannot publish new "
             "benchmark evidence)")
+    typed_meta = all(k in keys for k in _TYPED_META_KEYS)
+    if has_manifest and typed_meta and not object_meta:
+        return _load_dataset_validated(path)
+    # Explicit legacy mode: the trusted reader is the only path that
+    # evaluates pickle, and reaching it requires legacy=True.
+    return _load_dataset_trusted(path)
+
+
+def _load_dataset_validated(path: str) -> BookDataset:
+    """Default-loader path: pickle-free, fully validated.
+
+    Split identity is self-consistency against the dataset's own
+    embedded manifest (FF-N03 ruling): the manifest is the tamper
+    reference, so window counts, per-split session membership, and the
+    session_split record must all agree with the arrays.
+    """
+    import json
+    z = np.load(path, allow_pickle=False)
+    manifest = json.loads(str(z["manifest_json"]))
+    msha = str(z["manifest_sha256"])
+    if (manifest_sha256(manifest) != msha
+            or manifest.get("manifest_sha256") != msha):
+        raise ValueError(
+            "embedded split-manifest SHA mismatch: the NPZ manifest "
+            "content does not hash to its recorded manifest SHA; "
+            "the artifact was edited or corrupted")
+    if manifest.get("manifest_schema_version") != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"embedded split manifest schema version "
+            f"{manifest.get('manifest_schema_version')} is not current "
+            f"schema {MANIFEST_SCHEMA_VERSION}")
+    split = (json.loads(str(z["session_split_json"]))
+             if "session_split_json" in z else {})
+    if split != manifest.get("session_split"):
+        raise ValueError(
+            "session_split_json disagrees with the embedded split "
+            "manifest session_split: the archive metadata was edited "
+            "or the records do not belong together")
+    n_chunks = int(z["n_chunks"])
+    chunks = manifest.get("chunks") or []
+    if manifest.get("n_chunks") != n_chunks or len(chunks) != n_chunks:
+        raise ValueError(
+            f"manifest n_chunks {manifest.get('n_chunks')} / chunk list "
+            f"{len(chunks)} does not match the NPZ n_chunks {n_chunks}")
+    meta: dict[str, list] = {}
+    for typed, field in (("chunk_dirs_json", "chunk_dirs"),
+                         ("chunk_hashes_json", "chunk_hashes"),
+                         ("chunk_symbols_json", "chunk_symbols")):
+        vals = json.loads(str(z[typed]))
+        if (not isinstance(vals, list) or len(vals) != n_chunks
+                or not all(isinstance(v, str) for v in vals)):
+            raise ValueError(
+                f"{typed} must be a list of {n_chunks} strings")
+        meta[field] = vals
+    windows = manifest.get("windows") or {}
+    manifest_split = manifest.get("session_split") or {}
+
+    def unpack(s: str) -> SplitWindows:
+        x, regime = z[f"{s}_x"], z[f"{s}_regime"]
+        t_start, t_end = z[f"{s}_t_start"], z[f"{s}_t_end"]
+        session_ids = z[f"{s}_session_ids"]
+        for name, arr, dt in (("x", x, np.float32),
+                              ("regime", regime, np.float32),
+                              ("t_start", t_start, np.float64),
+                              ("t_end", t_end, np.float64),
+                              ("session_ids", session_ids, np.int64)):
+            if arr.dtype != dt:
+                raise ValueError(
+                    f"{s}_{name} dtype {arr.dtype} != expected "
+                    f"{np.dtype(dt).name}: archive does not match the "
+                    f"typed dataset format")
+        if x.ndim != 3 or x.shape[1:] != (WINDOW, N_FEATURES):
+            raise ValueError(
+                f"{s}_x shape {x.shape} != (n, {WINDOW}, {N_FEATURES})")
+        n = int(x.shape[0])
+        if (regime.shape != (n, 2) or t_start.shape != (n,)
+                or t_end.shape != (n,) or session_ids.shape != (n,)):
+            raise ValueError(f"{s} split arrays disagree on window count")
+        if windows.get(s) != n:
+            raise ValueError(
+                f"manifest windows[{s!r}] records {windows.get(s)} "
+                f"windows but {s}_x holds {n}: split identity mismatch "
+                f"against the embedded manifest")
+        allowed = set(manifest_split.get(s, []))
+        bad = sorted(set(session_ids.tolist()) - allowed)
+        if bad:
+            raise ValueError(
+                f"{s} session_ids {bad} are not assigned to split "
+                f"{s!r} by the embedded manifest session_split: split "
+                f"identity mismatch")
+        for name, arr in (("x", x), ("regime", regime),
+                          ("t_start", t_start), ("t_end", t_end)):
+            if not np.isfinite(arr).all():
+                raise ValueError(f"{s}_{name} contains non-finite values")
+        return SplitWindows(x=x, regime=regime, t_start=t_start,
+                            t_end=t_end, session_ids=session_ids)
+
+    def _stats(key: str, width: int) -> np.ndarray:
+        arr = z[key]
+        if arr.dtype != np.float64 or arr.shape != (width,):
+            raise ValueError(
+                f"{key} dtype/shape {arr.dtype}/{arr.shape} != float64/"
+                f"({width},)")
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{key} contains non-finite values")
+        return arr
+
+    def _json_list(key):
+        return json.loads(str(z[key])) if key in z else []
+
+    return BookDataset(
+        train=unpack("train"), val=unpack("val"), test=unpack("test"),
+        feature_mean=_stats("feature_mean", N_FEATURES),
+        feature_std=_stats("feature_std", N_FEATURES),
+        regime_mean=_stats("regime_mean", 2),
+        regime_std=_stats("regime_std", 2),
+        n_seconds=int(z["n_seconds"]), n_chunks=n_chunks,
+        chunk_dirs=meta["chunk_dirs"],
+        chunk_hashes=meta["chunk_hashes"],
+        chunk_symbols=meta["chunk_symbols"],
+        chunk_stats=_json_list("chunk_stats_json"),
+        chunk_file_hashes=_json_list("chunk_file_hashes_json"),
+        chunk_time_ranges=_json_list("chunk_time_ranges_json"),
+        chunk_recorder_meta=_json_list("chunk_recorder_meta_json"),
+        code_sha=manifest.get("code_sha"),
+        manifest=manifest,
+        manifest_sha256=msha,
+        session_split=split,
+        legacy=False,
+    )
+
+
+def _load_dataset_trusted(path: str) -> BookDataset:
+    """Trusted reader for legacy archives (explicit legacy=True only).
+
+    This is the only loader path that opens an NPZ with
+    allow_pickle=True: the pre-FF-N03 layout stores chunk metadata as
+    object arrays, and the pre-C02 layout has no manifest at all.
+    Reaching this function requires the caller's explicit opt-in.
+    """
+    import json
+    z = np.load(path, allow_pickle=True)
+    has_manifest = "manifest_json" in z and "manifest_sha256" in z
     manifest = None
     msha = None
     if has_manifest:
@@ -844,8 +1020,12 @@ def load_dataset(path: str, legacy: bool = False) -> BookDataset:
                             t_start=z[f"{s}_t_start"], t_end=z[f"{s}_t_end"],
                             session_ids=ss)
 
-    def _str_list(key):
-        return [str(x) for x in z[key].tolist()] if key in z else []
+    def _meta_list(typed_key: str, object_key: str) -> list:
+        if typed_key in z:
+            return [str(v) for v in json.loads(str(z[typed_key]))]
+        if object_key in z:
+            return [str(v) for v in z[object_key].tolist()]
+        return []
 
     def _json_list(key):
         return json.loads(str(z[key])) if key in z else []
@@ -857,9 +1037,9 @@ def load_dataset(path: str, legacy: bool = False) -> BookDataset:
         feature_mean=z["feature_mean"], feature_std=z["feature_std"],
         regime_mean=z["regime_mean"], regime_std=z["regime_std"],
         n_seconds=int(z["n_seconds"]), n_chunks=int(z["n_chunks"]),
-        chunk_dirs=_str_list("chunk_dirs"),
-        chunk_hashes=_str_list("chunk_hashes"),
-        chunk_symbols=_str_list("chunk_symbols"),
+        chunk_dirs=_meta_list("chunk_dirs_json", "chunk_dirs"),
+        chunk_hashes=_meta_list("chunk_hashes_json", "chunk_hashes"),
+        chunk_symbols=_meta_list("chunk_symbols_json", "chunk_symbols"),
         chunk_stats=stats,
         chunk_file_hashes=_json_list("chunk_file_hashes_json"),
         chunk_time_ranges=_json_list("chunk_time_ranges_json"),
@@ -870,3 +1050,35 @@ def load_dataset(path: str, legacy: bool = False) -> BookDataset:
         session_split=split,
         legacy=not has_manifest,
     )
+
+
+def convert_legacy_dataset(src_path: str, dst_path: str) -> BookDataset:
+    """Convert a trusted legacy dataset NPZ to the safe typed format.
+
+    Opt-in and trusted: reading the source requires allow_pickle=True
+    (the legacy layout stores chunk metadata as object arrays), so call
+    this only on archives you trust. The source is opened read-only and
+    never rewritten; dst_path must name a different file, so the legacy
+    archive is preserved as historical.
+
+    A source that predates the C02 manifest gains one built from its
+    own recorded metadata (build_manifest), so the converted artifact
+    is self-describing and loads through the default safe loader. The
+    conversion fabricates no provenance the source did not record:
+    per-file raw hashes stay null where the source lacks them, and the
+    manifest records the source's own split assignment unchanged.
+    Returns the converted dataset as reloaded through the default
+    loader, so a successful return proves the roundtrip.
+    """
+    src = os.path.abspath(src_path)
+    dst = os.path.abspath(dst_path)
+    if src == dst:
+        raise ValueError(
+            "refusing to convert in place: source and destination are "
+            "the same file; the legacy archive is preserved as historical")
+    ds = _load_dataset_trusted(src_path)
+    if ds.manifest is None:
+        ds.manifest = build_manifest(ds)
+        ds.manifest_sha256 = ds.manifest["manifest_sha256"]
+    save_dataset(ds, dst_path)
+    return load_dataset(dst_path)
