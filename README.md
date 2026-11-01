@@ -70,6 +70,8 @@ flowchart LR
   N4["Conditional VAE"] --> N5["Held out diagnostics"]
 ```
 
+The denoiser is selectable: alongside the default convolutional stack, the model offers a dilated TCN, a compact 1-D U-Net and an attention variant, all held to the same parameter budget. An ablation harness (`examples/architecture_ablate.py`) measures theoretical and empirical receptive fields and compares the architectures in a single paired run; in that comparison the metrics disagreed across fidelity, discrimination and validation loss, so the convolutional stack remains the default.
+
 ## Evaluation protocol
 
 Splits are session-disjoint: whole recording sessions go to train, validation, or test, never split across them (six sessions train, one validation, one test). No raw second appears in more than one split by construction. Sessions are not meant to be joined into synthetic continuous market paths. The eight sessions are consecutive ~30-minute recordings from a single ~5.6-hour span, not eight independent market days. Evaluation asks separate questions about marginal distributions, temporal dependence, distinguishability and downstream utility.
