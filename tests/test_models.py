@@ -230,3 +230,200 @@ def test_stage3_flowforge_04_part_1_baseline_capture_reproducible():
     assert first["model"]["params"] == count_params(fresh.net)
     assert first["model"]["param_budget_max"] > first["model"]["params"]
     assert len(first["model"]["init_state_sha256"]) == 64
+
+
+# ------------------------------------------- P04 part 2: candidate archs
+# The candidates are built to the declarative specs pinned in part 1 and
+# measured under the part 1 fixture protocol (run ID p04-part1-baseline
+# streams for both init and the fixture input), so every number below is
+# paired with the baseline measurements in the part 1 tests.
+
+def _p04_fixture():
+    from flowforge.models import derive_seed, scoped_rng
+    ab = _load_ablate()
+    run_id = ab.BASELINE_RUN_ID
+    with scoped_rng(derive_seed(run_id, "p04:fixture")):
+        x = torch.randn(2, N_FEATURES, WINDOW)
+        regime = torch.randn(2, 2)
+    t = torch.full((2,), 3, dtype=torch.long)
+    return ab, run_id, x, t, regime
+
+
+def test_stage3_flowforge_04_part_2_dilated_tcn_spec_matches_implementation():
+    ab = _load_ablate()
+    net = BookDDPM(arch="dilated_tcn",
+                   run_id=ab.BASELINE_RUN_ID).net
+    convs = [m for m in net.modules() if isinstance(m, torch.nn.Conv1d)]
+    spec_dilations = [layer["dilation"] for layer in ab.DILATED_TCN_SPEC
+                      if layer["kind"] == "conv"]
+    # in/out convolutions plus six blocks of two convolutions, block
+    # dilations following the explicit cycle 1, 2, 4, 8, 16, 32
+    assert len(convs) == len(spec_dilations) == 14
+    assert [m.dilation[0] for m in convs] == spec_dilations
+    assert all(m.kernel_size == (3,) and m.stride == (1,) for m in convs)
+    # padding tracks dilation, so every convolution preserves length
+    assert all(m.padding == m.dilation for m in convs)
+
+
+def test_stage3_flowforge_04_part_2_dilated_tcn_influence_beyond_baseline_span():
+    ab, run_id, x, t, regime = _p04_fixture()
+    tcn = BookDDPM(arch="dilated_tcn", run_id=run_id).net
+    cnn = BookDDPM(run_id=run_id).net
+    target = WINDOW - 1
+    tcn_profile = ab.gradient_influence(tcn, x, t, regime, target)
+    cnn_profile = ab.gradient_influence(cnn, x, t, regime, target)
+    # offsets 19, 29, 41 are far outside the baseline span for this
+    # target (span ends at offset 51 looking back 8) but inside the
+    # TCN span: the TCN gradient there is several times the baseline
+    # gradient at the same offsets, so early-window signal demonstrably
+    # reaches the late prediction through the dilated feature path
+    for off in (19, 29, 41):
+        assert tcn_profile[off] > 0.012
+        assert tcn_profile[off] > 2.0 * cnn_profile[off]
+    # recorded honestly: at init the extreme corner (offset 0, distance
+    # 59) still sits near the normalization-leakage level even though
+    # the dilated path connects it; the demonstrated influence above is
+    # at distances up to 40
+    assert tcn_profile[0] < tcn_profile[29]
+
+
+def test_stage3_flowforge_04_part_2_compact_unet_spec_matches_implementation():
+    ab = _load_ablate()
+    net = BookDDPM(arch="compact_unet",
+                   run_id=ab.BASELINE_RUN_ID).net
+    convs = [m for m in net.modules() if isinstance(m, torch.nn.Conv1d)]
+    spec_shapes = [(layer["kernel"], layer["stride"])
+                   for layer in ab.COMPACT_UNET_SPEC
+                   if layer["kind"] == "conv"]
+    assert len(convs) == len(spec_shapes) == 9
+    assert [(m.kernel_size[0], m.stride[0]) for m in convs] == spec_shapes
+    # the claim is a span of half width 18, not full-window context
+    assert ab.oracle_influence_span(ab.COMPACT_UNET_SPEC, 0, WINDOW) \
+        == (0, 18)
+    assert ab.oracle_influence_span(ab.COMPACT_UNET_SPEC, WINDOW - 1,
+                                    WINDOW) == (WINDOW - 19, WINDOW - 1)
+
+
+def test_stage3_flowforge_04_part_2_compact_unet_influence_matches_its_span():
+    ab, run_id, x, t, regime = _p04_fixture()
+    net = BookDDPM(arch="compact_unet", run_id=run_id).net
+    bound = ab.INFLUENCE_RELATIVE_BOUND
+    for target, span in ((WINDOW - 1, [41, 59]), (WINDOW // 2, [12, 48])):
+        profile = ab.gradient_influence(net, x, t, regime, target)
+        got = ab.influence_summary(profile, target, 18)
+        assert got["span"] == span
+        # influence is demonstrably present where its field reaches
+        assert got["within_span_max_grad"] > 0.05
+        # and beyond its own span only the weak GroupNorm statistics
+        # coupling remains, under the same bound part 1 pinned for the
+        # baseline: the U-Net is not credited with global context
+        assert got["beyond_to_within_ratio"] < bound
+
+
+def test_stage3_flowforge_04_part_2_attention_global_mixing_is_exercised():
+    ab, run_id, x, t, regime = _p04_fixture()
+    net = BookDDPM(arch="attention", run_id=run_id).net
+    convs = [m for m in net.modules() if isinstance(m, torch.nn.Conv1d)]
+    attns = [m for m in net.modules()
+             if isinstance(m, torch.nn.MultiheadAttention)]
+    # the spec is one input convolution, one global mixing layer, one
+    # output convolution
+    assert len(convs) == 2 and len(attns) == 1
+    # every query position places nonzero weight on every key position:
+    # the mixing is global, not masked or windowed
+    ch = net.in_conv.out_channels
+    with torch.no_grad():
+        z = torch.randn(2, WINDOW, ch)
+        _, weights = net.attn(z, z, z, need_weights=True)
+    assert float(weights.min()) > 0.001
+    # functional demonstration: perturbing only input offset 0 leaves
+    # the attention block's input at the last position exactly unchanged
+    # (the input convolution is local), yet the block's output at the
+    # last position moves: the attention mix is the only path carrying
+    # the perturbation there
+    captured = []
+    hook = net.attn.register_forward_hook(
+        lambda m, i, o: captured.append(o[0].detach().clone()))
+    net(x, t, regime)
+    xp = x.clone()
+    xp[:, :, 0] += 2.0
+    net(xp, t, regime)
+    hook.remove()
+    base, pert = captured
+    assert float((pert - base)[:, WINDOW - 1, :].abs().mean()) > 0.001
+    with torch.no_grad():
+        local_base = net.in_conv(x)
+        local_pert = net.in_conv(xp)
+    assert float((local_pert - local_base)[:, :, WINDOW - 1]
+                 .abs().max()) == 0.0
+
+
+def test_stage3_flowforge_04_part_2_candidates_within_param_budget():
+    ab = _load_ablate()
+    baseline = count_params(BookDDPM(run_id=ab.BASELINE_RUN_ID).net)
+    assert baseline == 221767
+    for arch in ("dilated_tcn", "compact_unet", "attention"):
+        n = count_params(BookDDPM(arch=arch,
+                                  run_id=ab.BASELINE_RUN_ID).net)
+        # the part 1 rule (within the 5 percent ceiling) and the band
+        # from the other side: channel width is the knob, and every
+        # candidate lands inside the full 5 percent band
+        assert ab.within_param_budget(n, baseline)
+        assert n >= round(baseline * (1.0 - ab.PARAM_BUDGET_TOLERANCE))
+
+
+def test_stage3_flowforge_04_part_2_no_shape_or_padding_defects():
+    from flowforge.models import DENOISER_ARCHITECTURES
+    regime = torch.randn(2, 2)
+    for arch, cls in DENOISER_ARCHITECTURES.items():
+        net = cls()
+        for length in (32, 59, 60, 61, 120):
+            x = torch.randn(2, N_FEATURES, length)
+            t = torch.zeros(2, dtype=torch.long)
+            out = net(x, t, regime)
+            assert out.shape == x.shape, (arch, length)
+            assert torch.isfinite(out).all(), (arch, length)
+
+
+def test_stage3_flowforge_04_part_2_bookddpm_integration():
+    for arch in ("cnn", "dilated_tcn", "compact_unet", "attention"):
+        model = BookDDPM(arch=arch, run_id="p04-part2-smoke",
+                         t_steps=10)
+        x, regime = _batch(n=4)
+        loss = model.p_loss(x.permute(0, 2, 1).contiguous(), regime)
+        assert torch.isfinite(loss)
+        gen = model.sample(regime, seed=1)
+        assert gen.shape == (4, WINDOW, N_FEATURES)
+        assert torch.isfinite(gen).all()
+    try:
+        BookDDPM(arch="transformer")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown architecture must be rejected")
+
+
+def test_stage3_flowforge_04_part_2_paired_comparison_smoke():
+    from flowforge.models import derive_seed, scoped_rng
+    ab = _load_ablate()
+    with scoped_rng(derive_seed("p04-part2-smoke", "p04:data")):
+        splits = {
+            name: (torch.randn(n, WINDOW, N_FEATURES),
+                   torch.randn(n, 2))
+            for name, n in (("train", 48), ("val", 16), ("test", 16))
+        }
+    record = ab.compare_architectures(
+        splits, run_id="p04-part2-smoke", epochs=1, t_steps=20,
+        disc_epochs=3, verbose=False)
+    # one run, one record: baseline and candidates measured together
+    assert record["run_id"] == "p04-part2-smoke"
+    assert set(record["architectures"]) == {
+        "cnn", "dilated_tcn", "compact_unet", "attention"}
+    for arch, entry in record["architectures"].items():
+        assert entry["within_param_budget"]
+        assert len(entry["overfit_curve"]) == 1
+        assert np.isfinite(entry["fidelity_mean_w1"])
+        assert 0.0 <= entry["separation_auc_test"] <= 1.0
+        assert entry["latency_forward_median_ms_batch32"] > 0
+        assert len(entry["empirical_influence_at_last_offset"]
+                   ["gradient"]) == len(ab.INFLUENCE_OFFSETS)
