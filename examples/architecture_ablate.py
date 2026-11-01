@@ -45,6 +45,21 @@ pretending it is exactly zero, and the capture records both numbers.
 Part 1 captures the baseline only and promotes nothing. Part 2 implements
 the candidate specs and runs the paired fidelity, separation, latency and
 overfit comparison against this capture. Fixed seeds everywhere. CPU only.
+
+Part 2 (paired comparison)
+--------------------------
+compare_architectures trains every architecture in DENOISER_ARCHITECTURES
+on the same windows with the same seed streams, steps, and budget rule,
+and re-measures the baseline in the same run: fidelity is the marginal
+Wasserstein distance of samples generated for the validation regimes
+against the real validation windows, separation is the repository
+discriminator protocol (fit on validation, scored on test), latency is
+the paired protocol from part 1, and the overfit record is the per-epoch
+training loss next to a validation p-loss evaluated under one fixed
+evaluation stream shared by every architecture and epoch. Empirical
+influence is recorded per architecture at the last offset under the
+part 1 fixture protocol. Nothing is promoted by the comparison itself;
+the record reports what was measured, including null outcomes.
 """
 
 from __future__ import annotations
@@ -56,14 +71,25 @@ import os
 import sys
 import time
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from flowforge.data import N_FEATURES, WINDOW
+from flowforge.data import N_FEATURES, WINDOW, load_dataset
+from flowforge.evaluate import discriminator_auc, marginal_table
 from flowforge.models import BookDDPM, count_params, derive_seed, scoped_rng
 
 BASELINE_RUN_ID = "p04-part1-baseline"
+PART2_RUN_ID = "p04-part2-comparison"
+# BookDDPM architecture name -> spec name in ARCHITECTURE_SPECS.
+ARCH_TO_SPEC = {
+    "cnn": "baseline_cnn",
+    "dilated_tcn": "dilated_tcn",
+    "compact_unet": "compact_unet",
+    "attention": "attention",
+}
+INFLUENCE_OFFSETS = (0, 9, 19, 29, 41, 59)
 PARAM_BUDGET_TOLERANCE = 0.05
 # An architecture is called local to its oracle span when the largest
 # out-of-span input gradient is below this fraction of the largest
@@ -344,14 +370,208 @@ def spec_report() -> dict:
     return report
 
 
+def _eval_p_loss(model, x, regime, run_id: str, batch: int = 64) -> float:
+    """Validation p-loss under one fixed evaluation stream.
+
+    The stream is re-seeded identically on every call, so every
+    architecture and every epoch is scored on the same timesteps and
+    noise draws: the overfit curves are paired, not just comparable.
+    """
+    xc = x.permute(0, 2, 1).contiguous()
+    losses = []
+    with scoped_rng(derive_seed(run_id, "p04:valeval")):
+        with torch.no_grad():
+            for i in range(0, xc.shape[0], batch):
+                losses.append(float(model.p_loss(xc[i:i + batch],
+                                                 regime[i:i + batch])))
+    return sum(losses) / len(losses)
+
+
+def _train_with_curves(model, x, regime, val_x, val_regime, run_id: str,
+                       epochs: int, batch: int = 32, lr: float = 2e-4):
+    """train_ddpm's protocol (scoped stream, Adam, same batching) with a
+    per-epoch validation p-loss appended; no EMA, as in the default
+    comparator configuration."""
+    eff_seed = derive_seed(run_id, "train_ddpm")
+    with scoped_rng(eff_seed):
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        n = x.shape[0]
+        xc = x.permute(0, 2, 1).contiguous()
+        curve = []
+        for ep in range(epochs):
+            perm = torch.randperm(n)
+            tot, nb = 0.0, 0
+            for i in range(0, n, batch):
+                idx = perm[i:i + batch]
+                loss = model.p_loss(xc[idx], regime[idx])
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                tot += loss.item()
+                nb += 1
+            curve.append({
+                "epoch": ep,
+                "train_loss": tot / nb,
+                "val_loss": _eval_p_loss(model, val_x, val_regime, run_id),
+            })
+    return curve
+
+
+def compare_architectures(splits, run_id: str = PART2_RUN_ID,
+                          epochs: int = 12, t_steps: int = 100,
+                          batch: int = 32, lr: float = 2e-4,
+                          disc_epochs: int = 30,
+                          dataset_record: dict | None = None,
+                          verbose: bool = True) -> dict:
+    """Paired comparison of every denoiser architecture in one run.
+
+    ``splits`` maps "train"/"val"/"test" to (x, regime) float tensors in
+    the repository layout (n, WINDOW, N_FEATURES) / (n, 2). Every
+    architecture is initialised and trained from the same run ID
+    streams, for the same number of steps, and measured in this process;
+    the baseline is re-measured here rather than copied from the part 1
+    capture, so every number in the record is paired within the run.
+    """
+    train_x, train_regime = splits["train"]
+    val_x, val_regime = splits["val"]
+    test_x, test_regime = splits["test"]
+    baseline_params = count_params(BookDDPM(run_id=run_id).net)
+    with scoped_rng(derive_seed(run_id, "p04:fixture")):
+        fix_x = torch.randn(2, N_FEATURES, WINDOW)
+        fix_regime = torch.randn(2, 2)
+    fix_t = torch.full((2,), 3, dtype=torch.long)
+    record = {
+        "run_id": run_id,
+        "protocol": {
+            "epochs": epochs,
+            "batch": batch,
+            "lr": lr,
+            "t_steps": t_steps,
+            "ema": None,
+            "training": "train_ddpm protocol (scoped stream derived "
+                        "from the run ID, Adam, batch order and noise "
+                        "draws identical across architectures)",
+            "fidelity": "marginal_table mean W1, generated for the "
+                        "validation regimes vs real validation windows",
+            "separation": "discriminator_auc: fit on validation "
+                          "(real vs generated), scored on test",
+            "latency": "paired protocol: same process, batch 32, "
+                       "3 warmup + 15 timed passes, median; comparable "
+                       "only within this run",
+            "overfit": "per-epoch train p-loss and validation p-loss "
+                       "under one fixed evaluation stream",
+            "influence": "gradient influence at the last offset under "
+                         "the part 1 fixture streams, measured on the "
+                         "trained model at the end of the run",
+            "comparability": "all architectures measured in this single "
+                             "run on identical data and seed streams",
+        },
+        "dataset": dataset_record,
+        "baseline_params": baseline_params,
+        "param_budget_max": round(baseline_params
+                                  * (1.0 + PARAM_BUDGET_TOLERANCE)),
+        "architectures": {},
+    }
+    for arch in ARCH_TO_SPEC:
+        if verbose:
+            print(f"  comparing {arch} ...", flush=True)
+        model = BookDDPM(arch=arch, run_id=run_id, t_steps=t_steps)
+        net = model.net
+        params = count_params(net)
+        curve = _train_with_curves(model, train_x, train_regime,
+                                   val_x, val_regime, run_id, epochs,
+                                   batch=batch, lr=lr)
+        gen_val = model.sample(
+            val_regime, seed=derive_seed(run_id, "p04:gen:val")).numpy()
+        gen_test = model.sample(
+            test_regime, seed=derive_seed(run_id, "p04:gen:test")).numpy()
+        fidelity = marginal_table(val_x.numpy(), gen_val)
+        separation = discriminator_auc(
+            val_x.numpy(), gen_val, test_x.numpy(), gen_test,
+            seed=derive_seed(run_id, "p04:disc"), epochs=disc_epochs)
+        profile = gradient_influence(net, fix_x, fix_t, fix_regime,
+                                     WINDOW - 1)
+        spec = ARCHITECTURE_SPECS[ARCH_TO_SPEC[arch]]
+        record["architectures"][arch] = {
+            "spec": ARCH_TO_SPEC[arch],
+            "params": params,
+            "within_param_budget": within_param_budget(params,
+                                                       baseline_params),
+            "init_state_sha256": _state_dict_sha256(net),
+            "theoretical": {
+                "receptive_field": oracle_receptive_field(spec),
+                "half_width": (oracle_half_width(spec)
+                               if oracle_receptive_field(spec) is not None
+                               else None),
+            },
+            "overfit_curve": curve,
+            "final_train_loss": curve[-1]["train_loss"],
+            "final_val_loss": curve[-1]["val_loss"],
+            "fidelity_mean_w1": fidelity["mean_w1"],
+            "separation_auc_test": separation["auc_test"],
+            "separation_auc_val": separation["auc_val"],
+            "latency_forward_median_ms_batch32":
+                measure_forward_latency_ms(net),
+            "empirical_influence_at_last_offset": {
+                "offsets": list(INFLUENCE_OFFSETS),
+                "gradient": [float(profile[o]) for o in INFLUENCE_OFFSETS],
+                "max_gradient": float(profile.max()),
+            },
+        }
+    return record
+
+
+def load_comparison_splits(data_path: str):
+    """Load the historical dataset for a comparison run.
+
+    The canonical archive predates the typed NPZ format, so it is read
+    through the explicit legacy path; the record carries the file hash
+    and split counts so the population is identified exactly.
+    """
+    ds = load_dataset(data_path, legacy=True)
+    with open(data_path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    splits = {}
+    for name in ("train", "val", "test"):
+        part = getattr(ds, name)
+        splits[name] = (torch.from_numpy(np.asarray(part.x,
+                                                    dtype=np.float32)),
+                        torch.from_numpy(np.asarray(part.regime,
+                                                    dtype=np.float32)))
+    dataset_record = {
+        "path_basename": os.path.basename(data_path),
+        "sha256": digest,
+        "legacy_format": True,
+        "splits": {name: int(splits[name][0].shape[0])
+                   for name in splits},
+    }
+    return splits, dataset_record
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--run-id", default=BASELINE_RUN_ID)
     ap.add_argument("--out", default=None,
                     help="also write the capture JSON to this path")
+    ap.add_argument("--compare", action="store_true",
+                    help="run the part 2 paired architecture comparison")
+    ap.add_argument("--data", default=None,
+                    help="dataset NPZ for --compare (loaded legacy=True)")
+    ap.add_argument("--epochs", type=int, default=12)
+    ap.add_argument("--t-steps", type=int, default=100)
     args = ap.parse_args()
-    record = capture_baseline(args.run_id)
-    record["spec_report"] = spec_report()
+    if args.compare:
+        if not args.data:
+            ap.error("--compare requires --data")
+        run_id = (args.run_id if args.run_id != BASELINE_RUN_ID
+                  else PART2_RUN_ID)
+        splits, dataset_record = load_comparison_splits(args.data)
+        record = compare_architectures(
+            splits, run_id=run_id, epochs=args.epochs,
+            t_steps=args.t_steps, dataset_record=dataset_record)
+    else:
+        record = capture_baseline(args.run_id)
+        record["spec_report"] = spec_report()
     text = json.dumps(record, indent=2, sort_keys=True)
     print(text)
     if args.out:

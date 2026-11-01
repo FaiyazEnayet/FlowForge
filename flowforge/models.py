@@ -220,10 +220,12 @@ class TimeEmbed(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, ch: int, cond_dim: int):
+    def __init__(self, ch: int, cond_dim: int, dilation: int = 1):
         super().__init__()
-        self.conv1 = nn.Conv1d(ch, ch, 3, padding=1)
-        self.conv2 = nn.Conv1d(ch, ch, 3, padding=1)
+        self.conv1 = nn.Conv1d(ch, ch, 3, padding=dilation,
+                               dilation=dilation)
+        self.conv2 = nn.Conv1d(ch, ch, 3, padding=dilation,
+                               dilation=dilation)
         self.cond = nn.Linear(cond_dim, ch)
         self.norm1 = nn.GroupNorm(8, ch)
         self.norm2 = nn.GroupNorm(8, ch)
@@ -263,25 +265,195 @@ class Denoiser(nn.Module):
         return self.out(h)
 
 
+def _conditioning(regime_dim: int, tdim: int):
+    """The shared time/regime conditioning trunk every denoiser uses."""
+    time_embed = TimeEmbed(tdim)
+    regime_mlp = nn.Sequential(nn.Linear(regime_dim, tdim), nn.SiLU(),
+                               nn.Linear(tdim, tdim))
+    return time_embed, regime_mlp, tdim * 2
+
+
+class DilatedTCNDenoiser(nn.Module):
+    """Dilated residual TCN denoiser (P04 candidate).
+
+    Same conditioning interface and output head as :class:`Denoiser`, but
+    the same-resolution residual stack follows the explicit dilation
+    cycle 1, 2, 4, 8, 16, 32 (one ResBlock per dilation, both of its
+    convolutions at that dilation). The convolutional receptive field is
+    257 positions against the 60-position window, so early-window
+    offsets reach late predictions through the feature path. Channel
+    width 64 keeps the parameter count within the part 1 budget rule
+    (5 percent of the baseline Denoiser count).
+    """
+
+    DILATION_CYCLE = (1, 2, 4, 8, 16, 32)
+
+    def __init__(self, n_features: int = N_FEATURES, window: int = WINDOW,
+                 regime_dim: int = REGIME_DIM, ch: int = 64,
+                 tdim: int = 64):
+        super().__init__()
+        self.time_embed, self.regime_mlp, cond_dim = _conditioning(
+            regime_dim, tdim)
+        self.in_conv = nn.Conv1d(n_features, ch, 3, padding=1)
+        self.blocks = nn.ModuleList(
+            [ResBlock(ch, cond_dim, dilation=d)
+             for d in self.DILATION_CYCLE])
+        self.out = nn.Sequential(nn.GroupNorm(8, ch), nn.SiLU(),
+                                 nn.Conv1d(ch, n_features, 3, padding=1))
+        self.window = window
+        self.n_features = n_features
+
+    def forward(self, x, t, regime):
+        # x: (B, F, L)
+        c = torch.cat([self.time_embed(t), self.regime_mlp(regime)], dim=1)
+        h = self.in_conv(x)
+        for block in self.blocks:
+            h = block(h, c)
+        return self.out(h)
+
+
+class CompactUNetDenoiser(nn.Module):
+    """Compact downsample/upsample 1-D U-Net denoiser (P04 candidate).
+
+    Two stride-2 stages down to quarter resolution, a two-convolution
+    bottleneck, and mirrored nearest-neighbour upsampling stages with
+    additive skip connections from the encoder tensors at the same
+    resolution. Upsampling targets the skip tensor's length, so odd
+    input lengths keep their exact shape. The longest encoder-to-decoder
+    path has receptive field 37 (half width 18): wider than the baseline
+    CNN's 17, but not full-window context, and it is not claimed as such.
+    Conditioning is one shared projection of the time/regime vector,
+    added at the full-resolution stage, the bottleneck, and the last
+    decoder stage. Channel width 96 keeps the parameter count within
+    the part 1 budget rule.
+    """
+
+    def __init__(self, n_features: int = N_FEATURES, window: int = WINDOW,
+                 regime_dim: int = REGIME_DIM, ch: int = 96,
+                 tdim: int = 64):
+        super().__init__()
+        self.time_embed, self.regime_mlp, cond_dim = _conditioning(
+            regime_dim, tdim)
+        self.cond = nn.Linear(cond_dim, ch)
+        self.in_conv = nn.Conv1d(n_features, ch, 3, padding=1)
+        self.in_norm = nn.GroupNorm(8, ch)
+        self.down1 = nn.Conv1d(ch, ch, 3, stride=2, padding=1)
+        self.enc2 = nn.Conv1d(ch, ch, 3, padding=1)
+        self.enc2_norm = nn.GroupNorm(8, ch)
+        self.down2 = nn.Conv1d(ch, ch, 3, stride=2, padding=1)
+        self.mid1 = nn.Conv1d(ch, ch, 3, padding=1)
+        self.mid2 = nn.Conv1d(ch, ch, 3, padding=1)
+        self.mid_norm = nn.GroupNorm(8, ch)
+        self.dec1 = nn.Conv1d(ch, ch, 3, padding=1)
+        self.dec1_norm = nn.GroupNorm(8, ch)
+        self.dec2 = nn.Conv1d(ch, ch, 3, padding=1)
+        self.out = nn.Sequential(nn.GroupNorm(8, ch), nn.SiLU(),
+                                 nn.Conv1d(ch, n_features, 3, padding=1))
+        self.window = window
+        self.n_features = n_features
+
+    def forward(self, x, t, regime):
+        # x: (B, F, L)
+        c = torch.cat([self.time_embed(t), self.regime_mlp(regime)], dim=1)
+        cond = self.cond(c).unsqueeze(-1)
+        s1 = F.silu(self.in_norm(self.in_conv(x))) + cond
+        h = F.silu(self.enc2_norm(self.enc2(F.silu(self.down1(s1)))))
+        s2 = h
+        h = F.silu(self.down2(h))
+        h = F.silu(self.mid_norm(self.mid2(F.silu(self.mid1(h))))) + cond
+        h = F.interpolate(h, size=s2.shape[-1], mode="nearest") + s2
+        h = F.silu(self.dec1_norm(self.dec1(h)))
+        h = F.interpolate(h, size=s1.shape[-1], mode="nearest") + s1
+        h = F.silu(self.dec2(h)) + cond
+        return self.out(h)
+
+
+class AttentionDenoiser(nn.Module):
+    """Attention denoiser (P04 candidate): one global mixing layer.
+
+    An input convolution, a single multi-head self-attention block over
+    positions (no mask, so every position attends to every other
+    position: global context by construction) with a position-wise
+    feed-forward network, and an output convolution. This is the
+    minimal global-mixing variant declared in the part 1 spec, not a
+    transformer stack. Channel width 124 with a 4x feed-forward keeps
+    the parameter count within the part 1 budget rule.
+    """
+
+    def __init__(self, n_features: int = N_FEATURES, window: int = WINDOW,
+                 regime_dim: int = REGIME_DIM, ch: int = 124,
+                 tdim: int = 64, n_heads: int = 4):
+        super().__init__()
+        self.time_embed, self.regime_mlp, cond_dim = _conditioning(
+            regime_dim, tdim)
+        self.cond = nn.Linear(cond_dim, ch)
+        self.in_conv = nn.Conv1d(n_features, ch, 3, padding=1)
+        self.attn = nn.MultiheadAttention(ch, n_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(ch)
+        self.norm2 = nn.LayerNorm(ch)
+        self.ffn = nn.Sequential(nn.Linear(ch, 4 * ch), nn.SiLU(),
+                                 nn.Linear(4 * ch, ch))
+        self.out = nn.Sequential(nn.GroupNorm(1, ch), nn.SiLU(),
+                                 nn.Conv1d(ch, n_features, 3, padding=1))
+        self.window = window
+        self.n_features = n_features
+
+    def forward(self, x, t, regime):
+        # x: (B, F, L)
+        c = torch.cat([self.time_embed(t), self.regime_mlp(regime)], dim=1)
+        h = self.in_conv(x) + self.cond(c).unsqueeze(-1)
+        z = h.transpose(1, 2)  # (B, L, ch)
+        a, _ = self.attn(z, z, z, need_weights=False)
+        z = self.norm1(z + a)
+        z = self.norm2(z + self.ffn(z))
+        return self.out(z.transpose(1, 2))
+
+
+# Denoiser architectures selectable in BookDDPM. "cnn" is the shipped
+# default and its construction is unchanged; the others are the P04
+# candidates declared as layer specs in examples/architecture_ablate.py.
+DENOISER_ARCHITECTURES = {
+    "cnn": Denoiser,
+    "dilated_tcn": DilatedTCNDenoiser,
+    "compact_unet": CompactUNetDenoiser,
+    "attention": AttentionDenoiser,
+}
+
+
 class BookDDPM(nn.Module):
     def __init__(self, n_features: int = N_FEATURES, window: int = WINDOW,
                  t_steps: int = 100, beta_start: float = 1e-4,
                  beta_end: float = 0.08, ch: int = 96, n_blocks: int = 3,
                  seed: int | None = None, run_id: str | None = None,
-                 **kw):
+                 arch: str = "cnn", **kw):
         """Init weights draw from an isolated stream when seeded, exactly
         as :class:`CondVAE` does (stream "bookddpm:init" for a run ID).
-        Without a seed or run ID, init uses the global RNG as before."""
+        Without a seed or run ID, init uses the global RNG as before.
+
+        ``arch`` selects the denoiser from DENOISER_ARCHITECTURES. The
+        default "cnn" is the shipped Denoiser, constructed exactly as
+        before (``ch`` and ``n_blocks`` apply to it); the P04 candidate
+        architectures take their budget-matched widths by default and
+        accept overrides such as ``ch`` through ``**kw``.
+        """
         super().__init__()
+        if arch not in DENOISER_ARCHITECTURES:
+            raise ValueError(f"unknown denoiser architecture: {arch!r}")
+        denoiser_cls = DENOISER_ARCHITECTURES[arch]
         if seed is None and run_id is not None:
             seed = derive_seed(run_id, "bookddpm:init")
+
+        def _build():
+            if arch == "cnn":
+                return denoiser_cls(n_features=n_features, window=window,
+                                    ch=ch, n_blocks=n_blocks, **kw)
+            return denoiser_cls(n_features=n_features, window=window, **kw)
+
         if seed is None:
-            self.net = Denoiser(n_features=n_features, window=window, ch=ch,
-                                n_blocks=n_blocks, **kw)
+            self.net = _build()
         else:
             with scoped_rng(seed):
-                self.net = Denoiser(n_features=n_features, window=window,
-                                    ch=ch, n_blocks=n_blocks, **kw)
+                self.net = _build()
         self.t_steps = t_steps
         # Linear schedule with beta_end chosen so alpha_bar_T ~ 0.02: the
         # reverse chain must start from ~pure noise, and per-step betas must
