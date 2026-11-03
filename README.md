@@ -78,6 +78,8 @@ Splits are session-disjoint: whole recording sessions go to train, validation, o
 
 Model metrics below were computed under the previous split policy and will be refreshed on the next full retrain.
 
+The comparison layer is built to keep the headline honest. Block resampling and the VAR baseline respect session and segment boundaries, so no copied block or fitted lag crosses a recording break, and every copied window traces back to a training index. Alongside the VAE, the DDPM also faces a regime-matched chunk-copy baseline (copy the training block whose regime is closest to the target regime) and a lightweight conditional autoregressive comparator. All of them are scored under identical test conditions with repeated seeds and full latency and cost accounting. Wasserstein differences, discriminator AUC, and downstream TSTR differences carry block-bootstrap intervals at several block lengths; with a single test session, those intervals are within-session rather than across-day evidence.
+
 The table above mixes two historical populations: the recorded bundle (demo/metrics.json) reports 937 / 199 / 198 windows from the earlier study, while 996 / 168 / 168 is the current split population. The two studies also used different DDPM capacities (221,767 versus 480,775 parameters), so the old figures are not a controlled architecture comparison.
 
 ![Marginal fidelity against the VAE baseline](docs/results.png)

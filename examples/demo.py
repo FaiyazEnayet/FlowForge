@@ -5,6 +5,10 @@
 3. Generates windows conditioned on VAL and TEST regime features.
 4. Prints the full real-vs-generated report on TEST (never seen by either
    model) and saves metrics to runs/metrics.json.
+5. Runs the baseline parity comparison: DDPM, VAE, the regime-matched
+   chunk-copy baseline, the conditional AR comparator, and VAR are all
+   scored under identical test conditions with repeated seeds, paired
+   block-bootstrap intervals, and full latency/NFE/cost accounting.
 
 Fixed seeds everywhere. CPU only.
 """
@@ -12,20 +16,27 @@ Fixed seeds everywhere. CPU only.
 import json
 import os
 import time
+import tracemalloc
 
 import numpy as np
 import torch
 
+from flowforge.baselines import (ConditionalARBaseline, VARBaseline,
+                                 RegimeMatchedChunkCopyBaseline,
+                                 segment_ids_from_windows)
 from flowforge.checkpoints import (load_checkpoint,
                                    save_inference_checkpoint)
 from flowforge.data import (N_FEATURES, WINDOW, check_manifest_file,
                             ensure_publishable, load_dataset)
-from flowforge.evaluate import full_report, print_report
+from flowforge.evaluate import (comparison_report, full_report,
+                                print_comparison_report, print_report)
 from flowforge.models import (LATENT_DIM, REGIME_DIM, BookDDPM, CondVAE,
                               count_params, sample_with_ema, set_seed,
                               train_ddpm, train_vae)
 
 SEED = 7
+COMPARISON_SEEDS = (SEED, SEED + 100, SEED + 200)
+COMPARISON_BLOCK_LENGTHS = (1, 5, 10, 20)
 DATA = os.path.join(os.path.dirname(__file__), "..", "data", "book_windows.npz")
 RUNS = os.path.join(os.path.dirname(__file__), "..", "runs")
 
@@ -96,6 +107,40 @@ def audit_saved_checkpoints(ckpt_root):
         _, manifest = load_checkpoint(os.path.join(ckpt_root, name))
         audited[name] = manifest
     return audited
+
+
+def _combined_cost(generate, nfe_per_window, n_windows):
+    """Run a (gen_val, gen_test) generator and record combined cost.
+
+    Every compared method reports the same cost fields: wall-clock
+    sampling seconds, seconds per 1k windows, peak traced memory, and
+    neural function evaluations (0 for the non-neural baselines).
+    """
+    tracemalloc.start()
+    t0 = time.perf_counter()
+    gen_val, gen_test = generate()
+    dt = time.perf_counter() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return gen_val, gen_test, {
+        "sample_seconds": dt,
+        "sample_seconds_per_1k": dt / max(n_windows, 1) * 1000,
+        "peak_memory_mb": peak / 1e6,
+        "nfe": int(nfe_per_window * n_windows),
+        "nfe_per_window": int(nfe_per_window),
+    }
+
+
+def _baseline_cost(stats_list, n_windows):
+    """Combine per-call baseline generation stats into one cost record."""
+    dt = sum(s["sample_seconds"] for s in stats_list)
+    return {
+        "sample_seconds": dt,
+        "sample_seconds_per_1k": dt / max(n_windows, 1) * 1000,
+        "peak_memory_mb": max(s["peak_memory_mb"] for s in stats_list),
+        "nfe": 0,
+        "nfe_per_window": 0,
+    }
 
 
 def main():
@@ -198,6 +243,66 @@ def main():
                            feature_std=ds.feature_std)
     print_report(rep_ddpm)
 
+    print("\n--- baseline parity: identical test conditions, "
+          "repeated seeds ---")
+    seg_train = segment_ids_from_windows(ds.train.session_ids,
+                                         ds.train.t_start, ds.train.t_end)
+    chunk_copy = RegimeMatchedChunkCopyBaseline(
+        ds.train.x, ds.train.regime, block_len=4,
+        session_ids=ds.train.session_ids, segment_ids=seg_train)
+    cond_ar = ConditionalARBaseline(order=1, ridge=1.0).fit(
+        ds.train.x, ds.train.regime)
+    var = VARBaseline(order=2, ridge=1.0).fit(
+        ds.train.x, session_ids=ds.train.session_ids,
+        segment_ids=seg_train)
+    n_val, n_test = len(ds.val.x), len(ds.test.x)
+    runs = []
+    for seed in COMPARISON_SEEDS:
+        def _gen_vae(seed=seed):
+            with torch.inference_mode():
+                return (vae.generate(r_val, seed=seed).numpy(),
+                        vae.generate(r_test, seed=seed + 1).numpy())
+
+        gv, gt, cost = _combined_cost(_gen_vae, 1, n_val + n_test)
+        runs.append({"method": "vae", "kind": "conditional", "seed": seed,
+                     "gen_val": gv, "gen_test": gt, "cost": cost})
+
+        def _gen_ddpm(seed=seed):
+            if ddpm_ema is not None:
+                return (
+                    sample_with_ema(ddpm, ddpm_ema, r_val, seed=seed,
+                                    batch_size=32).numpy(),
+                    sample_with_ema(ddpm, ddpm_ema, r_test, seed=seed + 1,
+                                    batch_size=32).numpy())
+            return (ddpm.sample(r_val, seed=seed, batch_size=32).numpy(),
+                    ddpm.sample(r_test, seed=seed + 1,
+                                batch_size=32).numpy())
+
+        gv, gt, cost = _combined_cost(_gen_ddpm, ddpm.t_steps,
+                                      n_val + n_test)
+        runs.append({"method": "ddpm", "kind": "conditional", "seed": seed,
+                     "gen_val": gv, "gen_test": gt, "cost": cost})
+        gv, s1 = chunk_copy.generate(n_val, ds.val.regime, seed=seed)
+        gt, s2 = chunk_copy.generate(n_test, ds.test.regime, seed=seed)
+        runs.append({"method": "chunk_copy", "kind": "conditional",
+                     "seed": seed, "gen_val": gv, "gen_test": gt,
+                     "cost": _baseline_cost([s1, s2], n_val + n_test)})
+        gv, s1 = cond_ar.generate(n_val, ds.val.regime, seed=seed)
+        gt, s2 = cond_ar.generate(n_test, ds.test.regime, seed=seed)
+        runs.append({"method": "conditional_ar", "kind": "conditional",
+                     "seed": seed, "gen_val": gv, "gen_test": gt,
+                     "cost": _baseline_cost([s1, s2], n_val + n_test)})
+        gv, s1 = var.generate(n_val, ds.train.x, seed=seed)
+        gt, s2 = var.generate(n_test, ds.train.x, seed=seed)
+        runs.append({"method": "var", "kind": "unconditional",
+                     "seed": seed, "gen_val": gv, "gen_test": gt,
+                     "cost": _baseline_cost([s1, s2], n_val + n_test)})
+    parity = comparison_report(
+        ds.test.x, ds.val.x, runs,
+        block_lengths=COMPARISON_BLOCK_LENGTHS, n_boot=100,
+        n_test_sessions=len(np.unique(ds.test.session_ids)))
+    print_comparison_report(parity)
+
     os.makedirs(RUNS, exist_ok=True)
     # raw score arrays are for the figures script, not the JSON report.
     # full_report attaches them to both model reports; pop them first.
@@ -227,6 +332,7 @@ def main():
                      "weights_source": ddpm_manifest["weights_source"]},
         },
         "vae": rep_vae, "ddpm": rep_ddpm,
+        "baseline_parity": parity,
         "vae_final_loss": vae_hist[-1], "ddpm_final_loss": ddpm_hist[-1],
         "train_minutes": (time.time() - t0) / 60,
     }

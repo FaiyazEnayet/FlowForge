@@ -28,6 +28,8 @@ distributions is ~0). If a check fails, the metric is wrong, not the test.
 
 from __future__ import annotations
 
+from itertools import combinations
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -398,6 +400,384 @@ def tstr_flow_direction(real_val: np.ndarray, gen_val: np.ndarray,
             w, mu, sd = fit(x, y)
             out[f"acc_{name}"] = accuracy(w, mu, sd, xt, yt)
     return out
+
+
+# --------------------------------------- baseline parity comparison (C03)
+
+def _block_resample_indices(n: int, block_len: int,
+                            rng: np.random.Generator) -> np.ndarray:
+    """Chronological moving-block resample indices for n positions."""
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
+    block_len = int(min(max(1, block_len), n))
+    n_blocks = int(np.ceil(n / block_len))
+    starts = rng.integers(0, n - block_len + 1, size=n_blocks)
+    return np.concatenate(
+        [np.arange(s, s + block_len) for s in starts])[:n]
+
+
+def _pooled_w1(real: np.ndarray, gen: np.ndarray) -> float:
+    """Mean pooled 1-Wasserstein distance across features.
+
+    For equal-size samples this is the exact empirical W1: the mean
+    absolute difference of the sorted samples, per feature.
+    """
+    vals = []
+    for j in range(real.shape[2]):
+        a = np.sort(np.asarray(real[:, :, j], dtype=np.float64).ravel())
+        b = np.sort(np.asarray(gen[:, :, j], dtype=np.float64).ravel())
+        vals.append(float(np.mean(np.abs(a - b))))
+    return float(np.mean(vals))
+
+
+def _paired_w1_diffs(real: np.ndarray, gen_by_method: dict,
+                     block_len: int, n_boot: int,
+                     seed: int) -> dict:
+    """Bootstrap W1 differences per method pair.
+
+    Every replicate draws ONE chronological block-resample index vector
+    and applies it to the real windows and to every method's generated
+    windows, so the pairing is exact: methods are compared on identical
+    resampled real/generated blocks.
+    """
+    methods = sorted(gen_by_method)
+    diffs = {(a, b): [] for a, b in combinations(methods, 2)}
+    rng = np.random.default_rng(seed)
+    n = len(real)
+    for _ in range(n_boot):
+        idx = _block_resample_indices(n, block_len, rng)
+        w1 = {m: _pooled_w1(real[idx], gen_by_method[m][idx])
+              for m in methods}
+        for pair in diffs:
+            diffs[pair].append(w1[pair[0]] - w1[pair[1]])
+    return {pair: np.asarray(v) for pair, v in diffs.items()}
+
+
+def paired_block_bootstrap_w1(real: np.ndarray, gen_by_method: dict,
+                              block_lengths=(1, 5, 10, 20),
+                              n_boot: int = 200,
+                              seeds=(0,)) -> list[dict]:
+    """Paired block-bootstrap intervals for W1 differences between
+    generators, at several block lengths, pooled over `seeds`."""
+    point = {m: marginal_table(real, g)["mean_w1"]
+             for m, g in gen_by_method.items()}
+    rows = []
+    for block_len in block_lengths:
+        pooled: dict = {}
+        for seed in seeds:
+            d = _paired_w1_diffs(real, gen_by_method, block_len,
+                                 n_boot, seed + 1000 * block_len)
+            for pair, vals in d.items():
+                pooled.setdefault(pair, []).extend(vals.tolist())
+        for pair, vals in sorted(pooled.items()):
+            vals = np.asarray(vals)
+            rows.append({
+                "block_len": int(block_len),
+                "methods": [pair[0], pair[1]],
+                "diff": point[pair[0]] - point[pair[1]],
+                "ci": [float(np.quantile(vals, 0.025)),
+                       float(np.quantile(vals, 0.975))],
+                "n_boot": int(len(vals)),
+                "seeds": [int(s) for s in seeds],
+            })
+    return rows
+
+
+def blocked_auc_interval(scores_real: np.ndarray, scores_gen: np.ndarray,
+                         block_lengths=(1, 5, 10, 20), n_boot: int = 200,
+                         seed: int = 0) -> dict:
+    """Block-bootstrap intervals for a discriminator AUC.
+
+    The real and generated test scores form two chronological groups;
+    each replicate resamples moving blocks inside each group (never
+    individual windows), preserving the dependence the overlapping
+    windows induce.
+    """
+    sr = np.asarray(scores_real, dtype=np.float64).ravel()
+    sg = np.asarray(scores_gen, dtype=np.float64).ravel()
+    y = np.concatenate([np.ones(len(sr)), np.zeros(len(sg))])
+    auc = auc_score(y, np.concatenate([sr, sg]))
+    rows = []
+    for block_len in block_lengths:
+        rng = np.random.default_rng(seed + 1000 * int(block_len))
+        vals = []
+        for _ in range(n_boot):
+            ir = _block_resample_indices(len(sr), block_len, rng)
+            ig = _block_resample_indices(len(sg), block_len, rng)
+            yy = np.concatenate([np.ones(len(ir)), np.zeros(len(ig))])
+            vals.append(auc_score(yy, np.concatenate([sr[ir], sg[ig]])))
+        vals = np.asarray(vals)
+        rows.append({"block_len": int(block_len), "auc": float(auc),
+                     "ci": [float(np.quantile(vals, 0.025)),
+                            float(np.quantile(vals, 0.975))],
+                     "n_boot": int(n_boot)})
+    return {"rows": rows, "method": "blocked_bootstrap_auc"}
+
+
+def _tstr_fit_predict(x_train: np.ndarray, y_train: np.ndarray,
+                      x_test: np.ndarray, seed: int,
+                      epochs: int) -> np.ndarray:
+    """Fit the TSTR logistic model and return test class predictions."""
+    if len(np.unique(y_train)) < 2:
+        return np.full(len(x_test), bool(y_train[0] > 0.5))
+    set_seed(seed)
+    mu, sd = x_train.mean(axis=0), x_train.std(axis=0) + 1e-8
+    w = torch.zeros(x_train.shape[1] + 1, dtype=torch.float32,
+                    requires_grad=True)
+    opt = torch.optim.Adam([w], lr=0.1)
+    bce = nn.BCEWithLogitsLoss()
+    xb = torch.from_numpy(np.column_stack(
+        [(x_train - mu) / sd, np.ones(len(x_train))]).astype(np.float32))
+    yb = torch.from_numpy(y_train.astype(np.float32))
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = bce(xb @ w, yb)
+        loss.backward()
+        opt.step()
+    wn = w.detach().numpy()
+    s = 1.0 / (1.0 + np.exp(-((x_test - mu) / sd @ wn[:-1] + wn[-1])))
+    return s > 0.5
+
+
+def _paired_tstr_collect(gen_val_by_method: dict, real_val: np.ndarray,
+                         real_test: np.ndarray, block_lengths,
+                         n_boot: int, seed: int, epochs: int):
+    """Per-method TSTR accuracies and paired accuracy-difference draws.
+
+    Every method's classifier is trained and tested under the identical
+    protocol (same seed, epochs, real test windows). Paired differences
+    resample chronological blocks of the shared test windows, applying
+    the same index vector to every method's correctness array.
+    """
+    xr, yr = _tstr_xy(real_val)
+    xt, yt = _tstr_xy(real_test)
+    y_test = yt > 0.5
+    real_pred = _tstr_fit_predict(xr, yr, xt, seed, epochs)
+    real_correct = real_pred == y_test
+    majority = (float(max(yt.mean(), 1.0 - yt.mean())) if len(yt)
+                else float("nan"))
+    stats: dict = {}
+    correct: dict = {}
+    for name, gv in gen_val_by_method.items():
+        xs, ys = _tstr_xy(gv)
+        pred = _tstr_fit_predict(xs, ys, xt, seed, epochs)
+        correct[name] = (pred == y_test)
+        stats[name] = {
+            "acc_synth": float(correct[name].mean()) if len(yt)
+            else float("nan"),
+            "acc_real": float(real_correct.mean()) if len(yt)
+            else float("nan"),
+            "majority": majority,
+            "n_train_synth": int(len(xs)),
+            "n_train_real": int(len(xr)),
+            "n_test": int(len(xt)),
+        }
+    diffs: dict = {}
+    for block_len in block_lengths:
+        rng = np.random.default_rng(seed + 1000 * int(block_len))
+        for _ in range(n_boot):
+            idx = _block_resample_indices(len(yt), block_len, rng)
+            for a, b in combinations(sorted(correct), 2):
+                diffs.setdefault((int(block_len), (a, b)), []).append(
+                    float(correct[a][idx].mean() - correct[b][idx].mean()))
+    return stats, diffs
+
+
+def _ci_rows(diffs: dict, point_diffs: dict) -> list[dict]:
+    rows = []
+    for (block_len, pair), vals in sorted(diffs.items()):
+        vals = np.asarray(vals, dtype=np.float64)
+        rows.append({
+            "block_len": int(block_len),
+            "methods": [pair[0], pair[1]],
+            "diff": point_diffs[pair],
+            "ci": [float(np.quantile(vals, 0.025)),
+                   float(np.quantile(vals, 0.975))],
+            "n_boot": int(len(vals)),
+        })
+    return rows
+
+
+COMPARISON_SCHEMA = "flowforge-baseline-parity/1"
+COMPARISON_REQUIRED_METHODS = ("ddpm", "vae", "chunk_copy")
+COMPARISON_COST_KEYS = ("sample_seconds", "sample_seconds_per_1k",
+                        "peak_memory_mb", "nfe")
+
+
+def comparison_report(real_test: np.ndarray, real_val: np.ndarray,
+                      runs: list[dict],
+                      block_lengths=(1, 5, 10, 20), n_boot: int = 100,
+                      disc_epochs: int = 30, tstr_epochs: int = 300,
+                      protocol_seed: int = 0,
+                      n_test_sessions: int | None = None) -> dict:
+    """Baseline parity report: every method under identical conditions.
+
+    `runs` is a list of {method, kind, seed, gen_val, gen_test, cost}
+    records. The published schema requires DDPM, VAE, and the
+    regime-matched chunk-copy baseline; further methods (VAR, the
+    conditional AR comparator) are optional. Every method must report
+    the same seed set and the same val/test window counts, every run
+    must carry latency, throughput, peak-memory, and NFE metadata, and
+    every method is scored with the identical held-out discriminator
+    protocol (same architecture, epochs, and protocol seed, fit on val,
+    scored on test) and the identical TSTR protocol.
+
+    Uncertainty is dependence-aware: W1 differences use paired
+    chronological block resamples shared across methods, AUC intervals
+    resample blocks inside the real and generated score groups, and
+    TSTR differences are paired over blocks of the shared test windows.
+    With one test session the intervals are within-session rather than
+    across-day evidence, and the report says so.
+    """
+    if not runs:
+        raise ValueError("comparison requires at least one run")
+    by_method: dict[str, list[dict]] = {}
+    for run in runs:
+        for key in COMPARISON_COST_KEYS:
+            if key not in run.get("cost", {}):
+                raise ValueError(
+                    f"run for {run.get('method')!r} lacks cost metadata "
+                    f"{key!r}: no reported result may lack latency, NFE, "
+                    f"or cost metadata")
+        if run["gen_val"].shape != real_val.shape \
+                or run["gen_test"].shape != real_test.shape:
+            raise ValueError(
+                f"run for {run['method']!r} does not match the shared "
+                f"val/test window counts")
+        by_method.setdefault(run["method"], []).append(run)
+    missing = [m for m in COMPARISON_REQUIRED_METHODS if m not in by_method]
+    if missing:
+        raise ValueError(
+            f"published metrics schema requires DDPM + VAE + chunk-copy "
+            f"results; missing {missing}")
+    seed_sets = {m: sorted(r["seed"] for r in rs)
+                 for m, rs in by_method.items()}
+    if len({tuple(s) for s in seed_sets.values()}) != 1:
+        raise ValueError(
+            f"all methods must be evaluated on the same seed set, got "
+            f"{seed_sets}")
+    seeds = next(iter(seed_sets.values()))
+    for m, rs in by_method.items():
+        kinds = {r["kind"] for r in rs}
+        if len(kinds) != 1:
+            raise ValueError(f"method {m!r} mixes kinds {kinds}")
+
+    methods: dict = {}
+    for name, rs in by_method.items():
+        entry = {"kind": rs[0]["kind"], "runs": []}
+        for run in sorted(rs, key=lambda r: r["seed"]):
+            mt = marginal_table(real_test, run["gen_test"])
+            disc = discriminator_auc(real_val, run["gen_val"],
+                                     real_test, run["gen_test"],
+                                     seed=protocol_seed,
+                                     epochs=disc_epochs)
+            scores = np.asarray(disc.pop("test_scores"), dtype=np.float64)
+            n_real = int(disc.pop("test_n_real"))
+            disc["auc_ci"] = blocked_auc_interval(
+                scores[:n_real], scores[n_real:],
+                block_lengths=block_lengths, n_boot=n_boot,
+                seed=protocol_seed)
+            entry["runs"].append({
+                "seed": int(run["seed"]),
+                "mean_w1": mt["mean_w1"],
+                "marginals": mt,
+                "discriminator": disc,
+                "cost": run["cost"],
+            })
+        entry["mean_w1"] = float(np.mean([r["mean_w1"]
+                                          for r in entry["runs"]]))
+        entry["auc_test_mean"] = float(np.mean(
+            [r["discriminator"]["auc_test"] for r in entry["runs"]]))
+        methods[name] = entry
+
+    # paired W1 and TSTR, pooled over the repeated generation seeds
+    w1_diffs: dict = {}
+    w1_point = {m: methods[m]["mean_w1"] for m in methods}
+    tstr_diffs: dict = {}
+    tstr_point: dict = {}
+    run_by = {(r["method"], r["seed"]): r for r in runs}
+    for seed in seeds:
+        gens = {m: run_by[(m, seed)]["gen_test"] for m in by_method}
+        for block_len in block_lengths:
+            d = _paired_w1_diffs(real_test, gens, block_len, n_boot,
+                                 protocol_seed + 1000 * int(block_len))
+            for pair, vals in d.items():
+                w1_diffs.setdefault((int(block_len), pair),
+                                    []).extend(vals.tolist())
+        gen_vals = {m: run_by[(m, seed)]["gen_val"] for m in by_method}
+        stats, d = _paired_tstr_collect(
+            gen_vals, real_val, real_test, block_lengths, n_boot,
+            protocol_seed, tstr_epochs)
+        for key, vals in d.items():
+            tstr_diffs.setdefault(key, []).extend(vals)
+        for m, s in stats.items():
+            entry_run = next(r for r in methods[m]["runs"]
+                             if r["seed"] == seed)
+            entry_run["tstr"] = s
+            tstr_point[m] = s["acc_synth"]
+    w1_rows = _ci_rows(w1_diffs,
+                       {pair: w1_point[pair[0]] - w1_point[pair[1]]
+                        for (_, pair) in w1_diffs})
+    tstr_rows = _ci_rows(tstr_diffs,
+                         {pair: tstr_point[pair[0]] - tstr_point[pair[1]]
+                          for (_, pair) in tstr_diffs})
+    for name, entry in methods.items():
+        entry["tstr_acc_synth_mean"] = float(np.mean(
+            [r["tstr"]["acc_synth"] for r in entry["runs"]]))
+
+    if n_test_sessions is None:
+        n_test_sessions = 1
+    if n_test_sessions == 1:
+        ci_scope = "within-session rather than across-day evidence"
+        ci_scope_note = (
+            "All confidence intervals in this report are within-session "
+            "rather than across-day evidence: the test split contains a "
+            "single session, so the intervals quantify resampling "
+            "variability inside that session and say nothing about "
+            "variation across days.")
+    else:
+        ci_scope = "across-session evidence"
+        ci_scope_note = (
+            f"Intervals resample blocks within each of the "
+            f"{n_test_sessions} test sessions and pool them; they are "
+            f"across-session evidence about the recorded sessions, not "
+            f"about unrecorded days.")
+    return {
+        "schema": COMPARISON_SCHEMA,
+        "schema_version": 1,
+        "methods": methods,
+        "paired_w1": w1_rows,
+        "paired_tstr": tstr_rows,
+        "block_lengths": [int(b) for b in block_lengths],
+        "seeds": [int(s) for s in seeds],
+        "discriminator_protocol": {
+            "seed": int(protocol_seed), "epochs": int(disc_epochs),
+            "fit_split": "val", "score_split": "test",
+            "note": "identical protocol for every method and seed",
+        },
+        "n_val": int(len(real_val)),
+        "n_test": int(len(real_test)),
+        "n_test_sessions": int(n_test_sessions),
+        "ci_scope": ci_scope,
+        "ci_scope_note": ci_scope_note,
+    }
+
+
+def print_comparison_report(rep: dict) -> None:
+    print("\n=== baseline parity (identical test conditions, "
+          "repeated seeds) ===")
+    print(f"seeds: {rep['seeds']} | block lengths: {rep['block_lengths']}")
+    for name, m in rep["methods"].items():
+        print(f"{name:<14} kind={m['kind']:<13} "
+              f"mean W1 {m['mean_w1']:.3f} | "
+              f"disc AUC {m['auc_test_mean']:.3f} | "
+              f"TSTR acc {m['tstr_acc_synth_mean']:.3f}")
+    print("paired W1 differences (first minus second):")
+    for r in rep["paired_w1"]:
+        print(f"  block {r['block_len']:>2}: {r['methods'][0]} - "
+              f"{r['methods'][1]}: {r['diff']:+.3f} "
+              f"[{r['ci'][0]:+.3f}, {r['ci'][1]:+.3f}]")
+    print(rep["ci_scope_note"])
 
 
 def full_report(real_test: np.ndarray, gen_test: np.ndarray,
