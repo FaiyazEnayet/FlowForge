@@ -51,12 +51,27 @@ def derive_imbalance(log_bid_sz: np.ndarray,
     """Physical imbalance implied by bid/ask sizes.
 
     imbalance = (bid_sz - ask_sz) / (bid_sz + ask_sz), elementwise.
-    Sizes are reconstructed as exp(log_size).
+    Sizes are reconstructed as exp(log_size). Wherever the plain
+    exponentials are finite the direct ratio is used, bit for bit as
+    before; cells whose sizes overflow float64 fall back to a
+    max-shifted form that is algebraically identical, so the result
+    is finite and inside [-1, 1] for any finite inputs instead of
+    degenerating to inf/inf = nan.
     """
-    bid = np.exp(np.asarray(log_bid_sz, dtype=np.float64))
-    ask = np.exp(np.asarray(log_ask_sz, dtype=np.float64))
-    denom = (bid + ask).clip(min=1e-12)
-    return ((bid - ask) / denom).clip(-1.0, 1.0)
+    lb = np.asarray(log_bid_sz, dtype=np.float64)
+    la = np.asarray(log_ask_sz, dtype=np.float64)
+    with np.errstate(over="ignore", invalid="ignore"):
+        bid = np.exp(lb)
+        ask = np.exp(la)
+        denom = bid + ask
+        out = (bid - ask) / np.where(denom > 0, denom, 1.0)
+        bad = ~np.isfinite(out)
+        if bad.any():
+            m = np.maximum(lb, la)
+            b2 = np.exp(lb - m)
+            a2 = np.exp(la - m)
+            out = np.where(bad, (b2 - a2) / (b2 + a2), out)
+    return np.clip(out, -1.0, 1.0)
 
 
 def book_consistency_table(gen: np.ndarray, feature_mean: np.ndarray,
@@ -66,9 +81,31 @@ def book_consistency_table(gen: np.ndarray, feature_mean: np.ndarray,
 
     The generator emits log bid size, log ask size, and imbalance as
     independent features, but physically imbalance must equal
-    (bid_sz - ask_sz) / (bid_sz + ask_sz). This measures the violation
-    rate after inverse-transforming to physical units, plus sanity checks
-    for negative implied spread and negative implied trade count.
+    (bid_sz - ask_sz) / (bid_sz + ask_sz). The audit measures the
+    RAW generated imbalance against the size-implied value BEFORE
+    any clipping: an earlier version clipped the generated imbalance
+    to [-1, 1] first, which hid exactly the out-of-range violations
+    an audit exists to catch. Alongside the raw residual (mean/max
+    absolute error and violation rate over finite cells) it records:
+
+    - the raw imbalance range and the out-of-range rate (|imb| > 1);
+    - sign/finite/overflow checks: the fraction of cells holding a
+      non-finite feature value, and the fraction whose size
+      reconstruction overflows float64;
+    - spread nonnegativity on the implied spread in bps;
+    - trade-count validity: negative counts (the strict sign rate
+      counts counts below -tol, so float32 standardization dust of
+      order 1e-8 on a true zero is not misread as a negative count;
+      the legacy -0.5 threshold rate is kept alongside) and the
+      rate of counts that are not integers (judged against tol
+      plus a 1e-5 relative allowance: at extreme magnitudes the
+      float32 storage of standardized windows cannot represent
+      integer counts to an absolute 0.01);
+    - logical coherence: seconds whose rounded trade count is zero
+      but whose signed flow is nonzero.
+
+    The audit only reports. It never mutates or repairs its input;
+    repair is `constrain_imbalance`, a separate explicit step.
 
     gen: (n_windows, WINDOW, N_FEATURES) standardized generated windows.
     Returns violation fractions over all (window, timestep) cells.
@@ -78,23 +115,49 @@ def book_consistency_table(gen: np.ndarray, feature_mean: np.ndarray,
     j_ask = FEATURE_NAMES.index("log_ask_sz")
     j_imb = FEATURE_NAMES.index("imbalance")
     j_spr = FEATURE_NAMES.index("log_spread_bps")
+    j_sf = FEATURE_NAMES.index("signed_flow")
     j_cnt = FEATURE_NAMES.index("log_trade_count")
 
-    implied_imb = derive_imbalance(phys[:, :, j_bid], phys[:, :, j_ask])
-    gen_imb = phys[:, :, j_imb].clip(-1.0, 1.0)
-    imb_err = np.abs(gen_imb - implied_imb)
-    n_cells = imb_err.size
-
-    spread_bps = np.expm1(phys[:, :, j_spr])
-    trade_count = np.expm1(phys[:, :, j_cnt])
+    with np.errstate(over="ignore", invalid="ignore"):
+        raw_imb = phys[:, :, j_imb]
+        implied_imb = derive_imbalance(phys[:, :, j_bid],
+                                       phys[:, :, j_ask])
+        resid = raw_imb - implied_imb
+        abs_resid = np.abs(resid[np.isfinite(resid)])
+        spread_bps = np.expm1(phys[:, :, j_spr])
+        trade_count = np.expm1(phys[:, :, j_cnt])
+        count_round = np.round(trade_count)
+        size_overflow = ~np.isfinite(np.exp(phys[:, :, j_bid])) \
+            | ~np.isfinite(np.exp(phys[:, :, j_ask]))
+        nonfinite_cell = ~np.isfinite(phys).all(axis=2)
+        coherence_bad = (count_round == 0) \
+            & (np.abs(phys[:, :, j_sf]) > tol)
+        finite_raw = raw_imb[np.isfinite(raw_imb)]
 
     return {
-        "n_cells": int(n_cells),
-        "imbalance_violation_rate": float((imb_err > tol).mean()),
-        "imbalance_mae": float(imb_err.mean()),
-        "imbalance_max_err": float(imb_err.max()),
+        "n_cells": int(resid.size),
+        "imbalance_violation_rate":
+            float((abs_resid > tol).mean()) if abs_resid.size
+            else float("nan"),
+        "imbalance_mae":
+            float(abs_resid.mean()) if abs_resid.size else float("nan"),
+        "imbalance_max_err":
+            float(abs_resid.max()) if abs_resid.size else float("nan"),
+        "raw_imbalance_min":
+            float(finite_raw.min()) if finite_raw.size else float("nan"),
+        "raw_imbalance_max":
+            float(finite_raw.max()) if finite_raw.size else float("nan"),
+        "imbalance_out_of_range_rate":
+            float((np.abs(raw_imb) > 1.0).mean()),
+        "nonfinite_rate": float(nonfinite_cell.mean()),
+        "overflow_rate": float(size_overflow.mean()),
         "negative_spread_rate": float((spread_bps < 0).mean()),
         "negative_count_rate": float((trade_count < -0.5).mean()),
+        "count_negative_rate": float((trade_count < -tol).mean()),
+        "count_noninteger_rate":
+            float((np.abs(trade_count - count_round)
+                   > tol + 1e-5 * np.abs(trade_count)).mean()),
+        "coherence_violation_rate": float(coherence_bad.mean()),
         "tol": tol,
     }
 
@@ -795,16 +858,49 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
     if feature_mean is not None and feature_std is not None:
         pre = book_consistency_table(gen_test, feature_mean, feature_std)
         fixed = constrain_imbalance(gen_test, feature_mean, feature_std)
+        fixed_val = constrain_imbalance(gen_val, feature_mean,
+                                        feature_std)
         post = book_consistency_table(fixed, feature_mean, feature_std)
         # downstream fidelity: does the constraint fix move the marginals?
         pre_w1 = marginal_table(real_test, gen_test)["mean_w1"]
-        post_w1 = marginal_table(real_test, fixed)["mean_w1"]
+        con_marginals = marginal_table(real_test, fixed)
+        post_w1 = con_marginals["mean_w1"]
         rep["book_consistency"] = {
             "pre": pre,
             "post": post,
             "constrained": True,
             "marginal_w1_pre": pre_w1,
             "marginal_w1_post": post_w1,
+        }
+        # Both sampling modes, one identical protocol: the constrained
+        # windows go through the same marginals, flow ACF, held-out
+        # discriminator (same seed and splits), and TSTR as the raw
+        # windows above, and the postprocessing quality loss is the
+        # signed difference, reported whichever way it lands.
+        con_disc = dict(discriminator_auc(real_val, fixed_val,
+                                          real_test, fixed, seed=seed))
+        con_disc.pop("test_scores", None)  # keep the bundle JSON-safe
+        con_disc.pop("test_n_real", None)
+        con_tstr = tstr_flow_direction(real_val, fixed_val, real_test,
+                                       seed=seed)
+        rep["constrained"] = {
+            "marginals": con_marginals,
+            "flow_acf": flow_acf_table(real_test, fixed),
+            "discriminator": con_disc,
+            "tstr": con_tstr,
+        }
+        rep["postprocessing_quality_loss"] = {
+            "mean_w1_delta": post_w1 - pre_w1,
+            "discriminator_auc_test_delta":
+                con_disc["auc_test"] - rep["discriminator"]["auc_test"],
+            "tstr_acc_synth_delta":
+                con_tstr["acc_synth"] - rep["tstr"]["acc_synth"],
+            "note": ("constrained minus raw under the identical "
+                     "held-out protocol; a positive W1 or AUC delta "
+                     "means the constraint cost fidelity, a negative "
+                     "delta means it helped, zero means no measurable "
+                     "effect. Reported as measured, including when "
+                     "adverse or null."),
         }
     return rep
 
@@ -839,3 +935,24 @@ def print_report(rep: dict) -> None:
     print(f"(n_train_synth={t['n_train_synth']}, "
           f"n_train_real={t['n_train_real']}, n_test={t['n_test']}, "
           f"seed fixed)")
+    if "book_consistency" in rep:
+        bc = rep["book_consistency"]
+        print("\n=== book consistency audit (raw, before any repair) ===")
+        for name in ("pre", "post"):
+            r = bc[name]
+            print(f"{name}: imbalance violation "
+                  f"{r['imbalance_violation_rate']:.3f} "
+                  f"(raw MAE {r['imbalance_mae']:.4f}, raw range "
+                  f"[{r['raw_imbalance_min']:.3f}, "
+                  f"{r['raw_imbalance_max']:.3f}]), negative spread "
+                  f"{r['negative_spread_rate']:.3f}, non-integer count "
+                  f"{r['count_noninteger_rate']:.3f}, coherence "
+                  f"{r['coherence_violation_rate']:.3f}")
+        print(f"marginal W1 pre {bc['marginal_w1_pre']:.3f} -> "
+              f"post {bc['marginal_w1_post']:.3f}")
+    if "postprocessing_quality_loss" in rep:
+        ql = rep["postprocessing_quality_loss"]
+        print("\n=== postprocessing quality loss (constrained - raw) ===")
+        print(f"mean W1 {ql['mean_w1_delta']:+.4f} | discriminator AUC "
+              f"{ql['discriminator_auc_test_delta']:+.4f} | TSTR acc "
+              f"{ql['tstr_acc_synth_delta']:+.4f}")
