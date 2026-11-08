@@ -31,6 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .data import FEATURE_NAMES, N_FEATURES, WINDOW
+from .losses import predict_x0, total_auxiliary_loss
 
 LATENT_DIM = 16
 REGIME_DIM = 2
@@ -520,6 +521,9 @@ class BookDDPM(nn.Module):
             assert float(acp[-1]) < 0.05, f"alpha_bar_T={float(acp[-1]):.3f}; schedule broken"
         self.window = window
         self.n_features = n_features
+        # Unweighted auxiliary-loss components of the most recent
+        # p_loss call that used aux_weights (P06); empty otherwise.
+        self.last_aux_components: dict = {}
 
     def q_sample(self, x0, t, noise):
         # x: (B, F, L)
@@ -527,13 +531,35 @@ class BookDDPM(nn.Module):
         s1 = self.sqrt_1m_acp[t].view(-1, 1, 1)
         return s * x0 + s1 * noise
 
-    def p_loss(self, x0, regime):
+    def p_loss(self, x0, regime, aux_weights=None):
+        """Denoising loss, with optional statistical-structure penalties.
+
+        With ``aux_weights=None`` (the default) this is exactly the
+        plain denoising MSE as before. With a weights dict (see
+        flowforge.losses.DEFAULT_AUX_WEIGHTS for the predeclared low
+        weights) the loss adds the auxiliary penalties of
+        flowforge.losses, computed between the differentiable
+        denoised estimate of the clean window and this same training
+        batch's clean windows. The penalties only ever see training
+        batches: there is no path for a validation or test statistic
+        to enter. The unweighted components of the most recent call
+        are recorded on ``self.last_aux_components`` for logging.
+        """
         b = x0.shape[0]
         t = torch.randint(0, self.t_steps, (b,))
         noise = torch.randn_like(x0)
         xt = self.q_sample(x0, t, noise)
         pred = self.net(xt, t, regime)
-        return F.mse_loss(pred, noise)
+        mse = F.mse_loss(pred, noise)
+        if aux_weights is None:
+            return mse
+        x0_hat = predict_x0(xt, t, pred, self.sqrt_acp, self.sqrt_1m_acp)
+        aux_total, parts = total_auxiliary_loss(
+            x0_hat.permute(0, 2, 1), x0.permute(0, 2, 1),
+            weights=aux_weights)
+        self.last_aux_components = {
+            k: float(v.detach()) for k, v in parts.items()}
+        return mse + aux_total
 
     @torch.no_grad()
     def sample(self, regime, seed: int = 0,
@@ -649,11 +675,17 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
                epochs: int = 12, batch: int = 32, lr: float = 2e-4,
                seed: int = 0, verbose: bool = True,
                ema_decay: float | None = None,
-               run_id: str | None = None) -> tuple[list[float], EMA | None]:
+               run_id: str | None = None,
+               aux_weights: dict | None = None) -> tuple[list[float], EMA | None]:
     """Train on an isolated stream, as :func:`train_vae` does (stream
     "train_ddpm" for a run ID). Batch order and the per-step noise draws
     in :meth:`BookDDPM.p_loss` come from the scoped stream, and the
-    caller's global RNG state is restored exactly on return."""
+    caller's global RNG state is restored exactly on return.
+
+    ``aux_weights`` (P06) is passed through to p_loss: None keeps the
+    plain denoising objective; a weights dict adds the training-only
+    statistical-structure penalties from flowforge.losses. The loss
+    history records the total loss actually optimized."""
     eff_seed = derive_seed(run_id, "train_ddpm") if run_id is not None else seed
     with scoped_rng(eff_seed):
         opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -666,7 +698,11 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
             tot, nb = 0.0, 0
             for i in range(0, n, batch):
                 idx = perm[i:i + batch]
-                loss = model.p_loss(xc[idx], regime[idx])
+                if aux_weights is None:
+                    loss = model.p_loss(xc[idx], regime[idx])
+                else:
+                    loss = model.p_loss(xc[idx], regime[idx],
+                                        aux_weights=aux_weights)
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -902,7 +938,12 @@ class StructuralBookDDPM(BookDDPM):
             "_struct_std",
             torch.tensor(self._struct_std_np, dtype=torch.float32))
 
-    def p_loss(self, x0, regime):
+    def p_loss(self, x0, regime, aux_weights=None):
+        if aux_weights is not None:
+            raise ValueError(
+                "the statistical-structure auxiliary losses are defined "
+                "on the full seven-feature windows and are not applied "
+                "to the structural variant")
         b = x0.shape[0]
         t = torch.randint(0, self.t_steps, (b,), device=x0.device)
         noise = torch.randn_like(x0)
