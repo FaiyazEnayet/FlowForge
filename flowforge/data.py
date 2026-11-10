@@ -38,6 +38,16 @@ Leakage discipline (non-negotiable):
 Regime features per window (2 dims): realized volatility (std of 1s log
 returns over the 60s lookback) and mean spread in bps over the lookback.
 Standardized with train statistics.
+
+Past context (P03, opt-in via build_dataset's with_past_context): each
+window can also carry the full lookback as a tensor: the LOOKBACK
+seconds of book features immediately before the window start, drawn
+strictly from earlier seconds inside the same segment, standardized
+with the same train feature statistics as the windows, plus a boolean
+availability mask. A window exists only where the full lookback lies
+inside its segment, so a built context never crosses a recording gap
+or a session boundary and its mask is fully available; consumers that
+hold partial histories use the mask to mark the missing seconds.
 """
 
 from __future__ import annotations
@@ -86,6 +96,12 @@ class SplitWindows:
     t_start: np.ndarray    # window start time in seconds (absolute)
     t_end: np.ndarray      # window end time in seconds (absolute)
     session_ids: np.ndarray  # (n_windows,) int: source chunk index per window
+    # P03 past context, present only when the dataset was built with
+    # with_past_context=True: the LOOKBACK seconds strictly before
+    # each window, same standardization as x, and its availability
+    # mask (True = observed second). None for datasets without it.
+    past_context: np.ndarray | None = None  # (n_windows, LOOKBACK, N_FEATURES)
+    past_mask: np.ndarray | None = None     # (n_windows, LOOKBACK) bool
 
 
 @dataclass
@@ -233,9 +249,31 @@ def _windows_in_segment(seg: pd.DataFrame) -> list[tuple[int, int]]:
     return out
 
 
+def extract_past_context(seg_features: np.ndarray, start: int,
+                         lookback: int = LOOKBACK):
+    """Past context for the window starting at row ``start`` of one
+    segment's feature array.
+
+    Returns (context, mask): the ``lookback`` rows immediately before
+    ``start`` (strictly earlier seconds of the same segment, so the
+    context's last row is the second just before the window) and an
+    all-available boolean mask. Returns None when fewer than
+    ``lookback`` rows precede ``start`` inside this segment: a short
+    or boundary-crossing context is rejected, never borrowed from a
+    neighbouring segment or padded with another session's seconds.
+    """
+    if start < lookback:
+        return None
+    ctx = np.asarray(seg_features)[start - lookback:start]
+    if ctx.shape != (lookback, np.asarray(seg_features).shape[1]):
+        return None
+    return ctx, np.ones(lookback, dtype=bool)
+
+
 def build_dataset(chunk_dirs: list[str],
                   session_split: dict[str, list[int]] | None = None,
-                  code_sha: str | None = None) -> BookDataset:
+                  code_sha: str | None = None,
+                  with_past_context: bool = False) -> BookDataset:
     """Load chunks, build 1s bars, split by session, emit standardized windows.
 
     Session-disjoint splits (FL3): whole recording sessions (chunks) are
@@ -394,6 +432,8 @@ def build_dataset(chunk_dirs: list[str],
     raw_regime: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_t: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_session: dict[str, list] = {"train": [], "val": [], "test": []}
+    raw_ctx: dict[str, list] = {"train": [], "val": [], "test": []}
+    raw_ctx_mask: dict[str, list] = {"train": [], "val": [], "test": []}
 
     for ci, b in enumerate(ordered):
         split = chunk_to_split[ci]
@@ -416,6 +456,15 @@ def build_dataset(chunk_dirs: list[str],
                 raw_regime[split].append([vol, sp])
                 raw_t[split].append((float(w_t0), float(w_t1)))
                 raw_session[split].append(ci)
+                if with_past_context:
+                    # _windows_in_segment only emits starts with a
+                    # full in-segment lookback, so extraction cannot
+                    # fail here; the assert keeps that invariant loud.
+                    got = extract_past_context(arr, start)
+                    assert got is not None, \
+                        "window start without a full in-segment lookback"
+                    raw_ctx[split].append(got[0])
+                    raw_ctx_mask[split].append(got[1])
 
     for name in raw:
         if not raw[name]:
@@ -437,9 +486,18 @@ def build_dataset(chunk_dirs: list[str],
         tt = np.asarray(raw_t[name], dtype=np.float64)
         ss = np.asarray(raw_session[name], dtype=np.int64)
         assert np.isfinite(x).all() and np.isfinite(r).all()
+        ctx = mask = None
+        if with_past_context:
+            # the context is standardized with the SAME train feature
+            # statistics as the windows: exactly-matched normalization
+            ctx = ((np.stack(raw_ctx[name]) - f_mean)
+                   / f_std).astype(np.float32)
+            mask = np.stack(raw_ctx_mask[name])
+            assert np.isfinite(ctx).all()
         return SplitWindows(x=x.astype(np.float32), regime=r.astype(np.float32),
                             t_start=tt[:, 0], t_end=tt[:, 1],
-                            session_ids=ss)
+                            session_ids=ss, past_context=ctx,
+                            past_mask=mask)
 
     ds = BookDataset(
         train=pack("train"), val=pack("val"), test=pack("test"),
@@ -775,6 +833,17 @@ def save_dataset(ds: BookDataset, path: str) -> None:
     # NumPy object arrays, so the artifact contains nothing that needs
     # pickle to read back and the default loader can stay pickle-free.
     extra = {}
+    for s in ("train", "val", "test"):
+        sw = getattr(ds, s)
+        if (sw.past_context is None) != (sw.past_mask is None):
+            raise ValueError(
+                f"{s} split carries a past context without its mask "
+                f"or the reverse; refusing to save a half-described "
+                f"context")
+        if sw.past_context is not None:
+            extra[f"{s}_past_context"] = np.asarray(
+                sw.past_context, dtype=np.float32)
+            extra[f"{s}_past_mask"] = np.asarray(sw.past_mask, dtype=bool)
     if ds.manifest is not None:
         extra["manifest_json"] = np.array(json.dumps(ds.manifest))
     if ds.manifest_sha256 is not None:
@@ -943,8 +1012,31 @@ def _load_dataset_validated(path: str) -> BookDataset:
                           ("t_start", t_start), ("t_end", t_end)):
             if not np.isfinite(arr).all():
                 raise ValueError(f"{s}_{name} contains non-finite values")
+        ctx = mask = None
+        if f"{s}_past_context" in z or f"{s}_past_mask" in z:
+            if f"{s}_past_context" not in z or f"{s}_past_mask" not in z:
+                raise ValueError(
+                    f"{s} split carries a past context without its "
+                    f"mask or the reverse: corrupt artifact")
+            ctx, mask = z[f"{s}_past_context"], z[f"{s}_past_mask"]
+            if ctx.dtype != np.float32 \
+                    or ctx.shape != (n, LOOKBACK, N_FEATURES):
+                raise ValueError(
+                    f"{s}_past_context dtype/shape {ctx.dtype}/"
+                    f"{ctx.shape} != float32/(n, {LOOKBACK}, "
+                    f"{N_FEATURES}): archive does not match the typed "
+                    f"dataset format")
+            if mask.dtype != np.dtype(bool) \
+                    or mask.shape != (n, LOOKBACK):
+                raise ValueError(
+                    f"{s}_past_mask dtype/shape {mask.dtype}/"
+                    f"{mask.shape} != bool/(n, {LOOKBACK})")
+            if not np.isfinite(ctx).all():
+                raise ValueError(f"{s}_past_context contains "
+                                 f"non-finite values")
         return SplitWindows(x=x, regime=regime, t_start=t_start,
-                            t_end=t_end, session_ids=session_ids)
+                            t_end=t_end, session_ids=session_ids,
+                            past_context=ctx, past_mask=mask)
 
     def _stats(key: str, width: int) -> np.ndarray:
         arr = z[key]
@@ -959,8 +1051,16 @@ def _load_dataset_validated(path: str) -> BookDataset:
     def _json_list(key):
         return json.loads(str(z[key])) if key in z else []
 
+    splits = {s: unpack(s) for s in ("train", "val", "test")}
+    ctx_presence = {s: splits[s].past_context is not None
+                    for s in splits}
+    if len(set(ctx_presence.values())) > 1:
+        raise ValueError(
+            f"past context present in some splits but not others "
+            f"({ctx_presence}): the archive does not describe one "
+            f"consistent dataset")
     return BookDataset(
-        train=unpack("train"), val=unpack("val"), test=unpack("test"),
+        train=splits["train"], val=splits["val"], test=splits["test"],
         feature_mean=_stats("feature_mean", N_FEATURES),
         feature_std=_stats("feature_std", N_FEATURES),
         regime_mean=_stats("regime_mean", 2),
@@ -1016,9 +1116,25 @@ def _load_dataset_trusted(path: str) -> BookDataset:
                 f"corrupt artifact, refusing to invent -1 session identities")
         else:
             ss = np.full(z[f"{s}_x"].shape[0], -1, dtype=np.int64)
+        ctx = mask = None
+        if f"{s}_past_context" in z or f"{s}_past_mask" in z:
+            if f"{s}_past_context" not in z or f"{s}_past_mask" not in z:
+                raise ValueError(
+                    f"{s} split carries a past context without its "
+                    f"mask or the reverse: corrupt artifact")
+            ctx = np.asarray(z[f"{s}_past_context"], dtype=np.float32)
+            mask = np.asarray(z[f"{s}_past_mask"], dtype=bool)
+            n = z[f"{s}_x"].shape[0]
+            if ctx.shape != (n, LOOKBACK, N_FEATURES) \
+                    or mask.shape != (n, LOOKBACK):
+                raise ValueError(
+                    f"{s} past context/mask shapes {ctx.shape}/"
+                    f"{mask.shape} do not match ({n}, {LOOKBACK}, "
+                    f"{N_FEATURES}) windows")
         return SplitWindows(x=z[f"{s}_x"], regime=z[f"{s}_regime"],
                             t_start=z[f"{s}_t_start"], t_end=z[f"{s}_t_end"],
-                            session_ids=ss)
+                            session_ids=ss, past_context=ctx,
+                            past_mask=mask)
 
     def _meta_list(typed_key: str, object_key: str) -> list:
         if typed_key in z:
