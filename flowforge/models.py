@@ -15,6 +15,14 @@ Two models, both conditioned on regime features (recent volatility, spread):
     the trade count; imbalance is reconstructed deterministically at
     decode time instead of being generated as a redundant channel.
 
+History conditioning (P03, experimental, opt-in): BookDDPM and
+CondVAE can additionally condition on the full past context of each
+window (the LOOKBACK seconds before it, carried by the dataset as
+past_context/past_mask) through a small causal TCN encoder whose
+embedding is concatenated with the timestep and regime conditioning.
+The two-number regime variant remains the default and the comparator;
+nothing about the plain models changes when history is off.
+
 Everything is CPU sized. No trading, no order execution, no exchange
 connectivity anywhere in this file: these are pure sequence generators.
 """
@@ -93,7 +101,7 @@ def scoped_rng(seed: int):
 class CondVAE(nn.Module):
     def __init__(self, latent_dim: int = LATENT_DIM,
                  n_features: int = N_FEATURES, window: int = WINDOW,
-                 regime_dim: int = REGIME_DIM,
+                 regime_dim: int = REGIME_DIM, context_dim: int = 0,
                  seed: int | None = None, run_id: str | None = None):
         """Init weights draw from an isolated stream when seeded.
 
@@ -107,6 +115,10 @@ class CondVAE(nn.Module):
         self.latent_dim = latent_dim
         self.n_features = n_features
         self.window = window
+        # P03: with context_dim > 0 the decoder also conditions on a
+        # causal encoding of the window's past context. The default 0
+        # builds exactly the pre-P03 architecture.
+        self.context_dim = context_dim
         if seed is None and run_id is not None:
             seed = derive_seed(run_id, "condvae:init")
         flat = n_features * window
@@ -124,31 +136,47 @@ class CondVAE(nn.Module):
         self.mu = nn.Linear(128, self.latent_dim)
         self.logvar = nn.Linear(128, self.latent_dim)
         self.dec = nn.Sequential(
-            nn.Linear(self.latent_dim + regime_dim, 128), nn.SiLU(),
+            nn.Linear(self.latent_dim + regime_dim + self.context_dim,
+                      128), nn.SiLU(),
             nn.Linear(128, 256), nn.SiLU(),
             nn.Linear(256, flat),
         )
+        self.context_encoder = CausalContextEncoder(
+            n_features=self.n_features, emb_dim=self.context_dim) \
+            if self.context_dim else None
 
-    def forward(self, x, regime):
+    def forward(self, x, regime, past_context=None, past_mask=None):
         b = x.shape[0]
+        emb = _checked_context_embedding(
+            self.context_encoder, past_context, past_mask, b,
+            self.n_features, "CondVAE")
         h = self.enc(torch.cat([x.view(b, -1), regime], dim=1))
         mu, logvar = self.mu(h), self.logvar(h)
         std = torch.exp(0.5 * logvar)
         z = mu + std * torch.randn_like(std)
-        recon = self.dec(torch.cat([z, regime], dim=1)).view_as(x)
+        parts = [z, regime] + ([] if emb is None else [emb])
+        recon = self.dec(torch.cat(parts, dim=1)).view_as(x)
         return recon, mu, logvar
 
     @torch.no_grad()
     def generate(self, regime, n_per_regime: int = 1,
                  generator: torch.Generator | None = None,
-                 seed: int | None = None, run_id: str | None = None):
+                 seed: int | None = None, run_id: str | None = None,
+                 past_context=None, past_mask=None):
         """Sample latent codes from an isolated stream when requested.
 
         With ``generator``, ``seed``, or ``run_id`` (resolved to the
         "condvae:generate" stream) the latent draws come from that stream
         and the global RNG state is untouched. Without any of them the
         latent draws use the global RNG, as before.
+
+        A history-conditioned VAE (context_dim > 0) also requires the
+        batch's past context; its embedding is repeated alongside the
+        regime for ``n_per_regime``.
         """
+        emb = _checked_context_embedding(
+            self.context_encoder, past_context, past_mask,
+            regime.shape[0], self.n_features, "CondVAE")
         b = regime.shape[0] * n_per_regime
         reg = regime.repeat_interleave(n_per_regime, dim=0)
         if generator is None:
@@ -161,7 +189,10 @@ class CondVAE(nn.Module):
                             generator=generator)
         else:
             z = torch.randn(b, self.latent_dim, device=regime.device)
-        return self.dec(torch.cat([z, reg], dim=1)).view(
+        parts = [z, reg]
+        if emb is not None:
+            parts.append(emb.repeat_interleave(n_per_regime, dim=0))
+        return self.dec(torch.cat(parts, dim=1)).view(
             b, self.window, self.n_features)
 
 
@@ -174,11 +205,21 @@ def vae_loss(x, recon, mu, logvar, beta: float = 1e-3):
 def train_vae(model: CondVAE, x: torch.Tensor, regime: torch.Tensor,
               epochs: int = 25, batch: int = 64, lr: float = 1e-3,
               seed: int = 0, verbose: bool = True,
-              run_id: str | None = None) -> list[float]:
+              run_id: str | None = None,
+              past_context: torch.Tensor | None = None,
+              past_mask: torch.Tensor | None = None) -> list[float]:
     """Train on an isolated stream: batch order and reparameterization
     noise draw from a scoped stream seeded by ``seed`` (or by ``run_id``
     via the "train_vae" stream), and the caller's global RNG state is
-    restored exactly when training returns."""
+    restored exactly when training returns.
+
+    ``past_context``/``past_mask`` (P03) are passed per batch to a
+    history-conditioned VAE; passing them for a plain VAE is an error
+    rather than a silent no-op."""
+    if past_context is not None and not model.context_dim:
+        raise ValueError(
+            "past_context was passed but the VAE was built without "
+            "history conditioning (context_dim=0)")
     eff_seed = derive_seed(run_id, "train_vae") if run_id is not None else seed
     with scoped_rng(eff_seed):
         opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -189,7 +230,10 @@ def train_vae(model: CondVAE, x: torch.Tensor, regime: torch.Tensor,
             tot, nb = 0.0, 0
             for i in range(0, n, batch):
                 idx = perm[i:i + batch]
-                recon, mu, logvar = model(x[idx], regime[idx])
+                recon, mu, logvar = model(
+                    x[idx], regime[idx],
+                    past_context[idx] if past_context is not None else None,
+                    past_mask[idx] if past_mask is not None else None)
                 loss, _, _ = vae_loss(x[idx], recon, mu, logvar)
                 opt.zero_grad()
                 loss.backward()
@@ -200,6 +244,128 @@ def train_vae(model: CondVAE, x: torch.Tensor, regime: torch.Tensor,
             if verbose and (ep % 5 == 0 or ep == epochs - 1):
                 print(f"  vae epoch {ep:3d} loss {hist[-1]:.4f}", flush=True)
     return hist
+
+
+# ------------------------------------------- history conditioning (P03)
+
+class CausalContextEncoder(nn.Module):
+    """Causal TCN encoder for a window's past context.
+
+    Reads the seconds before a window as a sequence and returns one
+    embedding per window. Every convolution is left-padded (kernel 3,
+    dilations 1, 2, 4, 8), so the state at a context position depends
+    only on that position and earlier ones: the encoder is causal by
+    construction. Normalization is a per-position LayerNorm over
+    channels, which never mixes time steps (a norm pooled over the
+    sequence would leak whole-context statistics into early
+    positions). The embedding is a mask-aware mean of the
+    per-position states followed by a linear head: positions the
+    availability mask marks missing are zeroed before the
+    convolutions and excluded from the mean, so values stored at
+    unavailable seconds cannot influence the embedding. A window
+    with no available context position embeds as the zero vector.
+    """
+
+    DILATIONS = (1, 2, 4, 8)
+
+    def __init__(self, n_features: int = N_FEATURES, ch: int = 32,
+                 emb_dim: int = 64, seed: int | None = None):
+        super().__init__()
+        self.n_features = n_features
+        self.ch = ch
+        self.emb_dim = emb_dim
+
+        def _build():
+            self.in_proj = nn.Conv1d(n_features, ch, 1)
+            self.convs = nn.ModuleList(
+                [nn.Conv1d(ch, ch, 3, dilation=d)
+                 for d in self.DILATIONS])
+            self.norms = nn.ModuleList(
+                [nn.LayerNorm(ch) for _ in self.DILATIONS])
+            self.head = nn.Linear(ch, emb_dim)
+
+        if seed is None:
+            _build()
+        else:
+            with scoped_rng(seed):
+                _build()
+
+    def _check(self, context, mask):
+        if not isinstance(context, torch.Tensor) \
+                or context.ndim != 3 \
+                or context.shape[2] != self.n_features:
+            raise ValueError(
+                f"past context must have shape (batch, length, "
+                f"{self.n_features}), got "
+                f"{tuple(context.shape) if isinstance(context, torch.Tensor) else type(context)}")
+        if context.shape[0] == 0 or context.shape[1] == 0:
+            raise ValueError("past context batch and length must be "
+                             "non-empty")
+        if not bool(torch.isfinite(context).all()):
+            raise ValueError("past context contains non-finite values")
+        if mask is not None:
+            if not isinstance(mask, torch.Tensor) \
+                    or mask.shape != context.shape[:2]:
+                raise ValueError(
+                    f"past mask must have shape {tuple(context.shape[:2])}, "
+                    f"got {tuple(mask.shape) if isinstance(mask, torch.Tensor) else type(mask)}")
+
+    def encode_sequence(self, context, mask=None):
+        """Per-position causal states, (batch, length, ch)."""
+        self._check(context, mask)
+        x = context
+        if mask is not None:
+            x = x * mask.to(dtype=x.dtype, device=x.device).unsqueeze(-1)
+        h = self.in_proj(x.transpose(1, 2))
+        for conv, norm in zip(self.convs, self.norms):
+            d = conv.dilation[0]
+            y = conv(F.pad(h, (2 * d, 0)))
+            y = norm(y.transpose(1, 2)).transpose(1, 2)
+            h = h + F.silu(y)
+        return h.transpose(1, 2)
+
+    def forward(self, context, mask=None):
+        """One embedding per window, (batch, emb_dim)."""
+        states = self.encode_sequence(context, mask)
+        if mask is None:
+            pooled = states.mean(dim=1)
+            return self.head(pooled)
+        w = mask.to(dtype=states.dtype, device=states.device)
+        pooled = (states * w.unsqueeze(-1)).sum(dim=1) \
+            / w.sum(dim=1, keepdim=True).clamp(min=1.0)
+        emb = self.head(pooled)
+        any_avail = (w.sum(dim=1, keepdim=True) > 0).to(emb.dtype)
+        return emb * any_avail
+
+
+def _checked_context_embedding(encoder, past_context, past_mask, batch,
+                               n_features, owner):
+    """Encode a batch's past context, failing loudly on misuse.
+
+    A model built without history conditioning rejects a handed
+    context (conditioning is never silently dropped); a
+    history-conditioned model requires one for every batch.
+    Returns None for a non-history model handed nothing.
+    """
+    if encoder is None:
+        if past_context is not None:
+            raise ValueError(
+                f"{owner} was built without history conditioning "
+                f"but a past context was passed")
+        return None
+    if past_context is None:
+        raise ValueError(
+            f"{owner} is history-conditioned: pass past_context "
+            f"(and past_mask) for every batch")
+    if not isinstance(past_context, torch.Tensor) \
+            or past_context.ndim != 3 \
+            or past_context.shape[0] != batch \
+            or past_context.shape[2] != n_features:
+        raise ValueError(
+            f"past context must have shape ({batch}, length, "
+            f"{n_features}), got "
+            f"{tuple(past_context.shape) if isinstance(past_context, torch.Tensor) else type(past_context)}")
+    return encoder(past_context, past_mask)
 
 
 # ------------------------------------------------------------- DDPM diffusion
@@ -250,12 +416,17 @@ class Denoiser(nn.Module):
 
     def __init__(self, n_features: int = N_FEATURES, window: int = WINDOW,
                  regime_dim: int = REGIME_DIM, ch: int = 96, tdim: int = 64,
-                 n_blocks: int = 3):
+                 n_blocks: int = 3, context_dim: int = 0):
         super().__init__()
         self.time_embed = TimeEmbed(tdim)
         self.regime_mlp = nn.Sequential(nn.Linear(regime_dim, tdim), nn.SiLU(),
                                         nn.Linear(tdim, tdim))
-        cond_dim = tdim * 2
+        # P03: with context_dim > 0 the conditioning vector also
+        # carries a past-context embedding, concatenated after the
+        # timestep and regime parts. The default 0 builds exactly
+        # the pre-P03 conditioning width.
+        self.context_dim = context_dim
+        cond_dim = tdim * 2 + context_dim
         self.in_conv = nn.Conv1d(n_features, ch, 3, padding=1)
         self.blocks = nn.ModuleList([ResBlock(ch, cond_dim) for _ in range(n_blocks)])
         self.out = nn.Sequential(nn.GroupNorm(8, ch), nn.SiLU(),
@@ -263,9 +434,26 @@ class Denoiser(nn.Module):
         self.window = window
         self.n_features = n_features
 
-    def forward(self, x, t, regime):
+    def forward(self, x, t, regime, context_emb=None):
         # x: (B, F, L)
-        c = torch.cat([self.time_embed(t), self.regime_mlp(regime)], dim=1)
+        if self.context_dim:
+            if context_emb is None \
+                    or context_emb.shape != (x.shape[0], self.context_dim):
+                raise ValueError(
+                    f"this denoiser is history-conditioned: "
+                    f"context_emb must have shape ({x.shape[0]}, "
+                    f"{self.context_dim}), got "
+                    f"{tuple(context_emb.shape) if isinstance(context_emb, torch.Tensor) else context_emb}")
+            c = torch.cat([self.time_embed(t), self.regime_mlp(regime),
+                           context_emb], dim=1)
+        else:
+            if context_emb is not None:
+                raise ValueError(
+                    "this denoiser was built without history "
+                    "conditioning (context_dim=0) but a context "
+                    "embedding was passed")
+            c = torch.cat([self.time_embed(t), self.regime_mlp(regime)],
+                          dim=1)
         h = self.in_conv(x)
         for block in self.blocks:
             h = block(h, c)
@@ -473,7 +661,7 @@ class BookDDPM(nn.Module):
                  t_steps: int = 100, beta_start: float = 1e-4,
                  beta_end: float = 0.08, ch: int = 96, n_blocks: int = 3,
                  seed: int | None = None, run_id: str | None = None,
-                 arch: str = "cnn", **kw):
+                 arch: str = "cnn", use_history: bool = False, **kw):
         """Init weights draw from an isolated stream when seeded, exactly
         as :class:`CondVAE` does (stream "bookddpm:init" for a run ID).
         Without a seed or run ID, init uses the global RNG as before.
@@ -483,25 +671,47 @@ class BookDDPM(nn.Module):
         before (``ch`` and ``n_blocks`` apply to it); the P04 candidate
         architectures take their budget-matched widths by default and
         accept overrides such as ``ch`` through ``**kw``.
+
+        ``use_history`` (P03) additionally conditions on a causal
+        encoding of each window's past context: the denoiser is built
+        with a context slot and the model owns a
+        :class:`CausalContextEncoder`. It is wired for the default
+        cnn denoiser only, and it is off by default: a plain BookDDPM
+        constructs, trains, and samples exactly as before.
         """
         super().__init__()
         if arch not in DENOISER_ARCHITECTURES:
             raise ValueError(f"unknown denoiser architecture: {arch!r}")
+        if use_history and arch != "cnn":
+            raise ValueError(
+                "history conditioning is wired for the default cnn "
+                "denoiser; the candidate architectures keep the "
+                "two-number regime conditioning")
         denoiser_cls = DENOISER_ARCHITECTURES[arch]
         if seed is None and run_id is not None:
             seed = derive_seed(run_id, "bookddpm:init")
+        self.use_history = bool(use_history)
+        emb_dim = int(kw.get("tdim", 64))
 
         def _build():
             if arch == "cnn":
-                return denoiser_cls(n_features=n_features, window=window,
-                                    ch=ch, n_blocks=n_blocks, **kw)
-            return denoiser_cls(n_features=n_features, window=window, **kw)
+                net = denoiser_cls(
+                    n_features=n_features, window=window, ch=ch,
+                    n_blocks=n_blocks,
+                    context_dim=emb_dim if use_history else 0, **kw)
+            else:
+                net = denoiser_cls(n_features=n_features, window=window,
+                                   **kw)
+            enc = CausalContextEncoder(n_features=n_features,
+                                       emb_dim=emb_dim) \
+                if use_history else None
+            return net, enc
 
         if seed is None:
-            self.net = _build()
+            self.net, self.context_encoder = _build()
         else:
             with scoped_rng(seed):
-                self.net = _build()
+                self.net, self.context_encoder = _build()
         self.t_steps = t_steps
         # Linear schedule with beta_end chosen so alpha_bar_T ~ 0.02: the
         # reverse chain must start from ~pure noise, and per-step betas must
@@ -531,7 +741,8 @@ class BookDDPM(nn.Module):
         s1 = self.sqrt_1m_acp[t].view(-1, 1, 1)
         return s * x0 + s1 * noise
 
-    def p_loss(self, x0, regime, aux_weights=None):
+    def p_loss(self, x0, regime, aux_weights=None, past_context=None,
+               past_mask=None):
         """Denoising loss, with optional statistical-structure penalties.
 
         With ``aux_weights=None`` (the default) this is exactly the
@@ -544,12 +755,22 @@ class BookDDPM(nn.Module):
         batches: there is no path for a validation or test statistic
         to enter. The unweighted components of the most recent call
         are recorded on ``self.last_aux_components`` for logging.
+
+        A history-conditioned model (``use_history=True``) also
+        requires the batch's ``past_context``/``past_mask``: the
+        context is encoded causally and its embedding joins the
+        conditioning. A plain model rejects a handed context rather
+        than silently dropping it.
         """
+        emb = _checked_context_embedding(
+            self.context_encoder, past_context, past_mask,
+            x0.shape[0], self.n_features, "BookDDPM")
         b = x0.shape[0]
         t = torch.randint(0, self.t_steps, (b,))
         noise = torch.randn_like(x0)
         xt = self.q_sample(x0, t, noise)
-        pred = self.net(xt, t, regime)
+        pred = self.net(xt, t, regime, emb) if self.use_history \
+            else self.net(xt, t, regime)
         mse = F.mse_loss(pred, noise)
         if aux_weights is None:
             return mse
@@ -567,7 +788,8 @@ class BookDDPM(nn.Module):
                run_id: str | None = None,
                batch_size: int | None = None,
                mode: str = "raw",
-               feature_mean=None, feature_std=None):
+               feature_mean=None, feature_std=None,
+               past_context=None, past_mask=None):
         """Sample the reverse chain from an isolated stream.
 
         With ``generator`` the chain draws from it; otherwise a fresh
@@ -602,6 +824,11 @@ class BookDDPM(nn.Module):
         chain state is checked and a non-finite value raises
         FloatingPointError naming the step, instead of silently
         returning non-finite windows.
+
+        A history-conditioned model also requires ``past_context``
+        (and optionally ``past_mask``) aligned row-for-row with
+        ``regime``; the context embedding is computed once and sliced
+        alongside the regime for batched sampling.
         """
         if mode not in ("raw", "constrained"):
             raise ValueError(f"unknown sampling mode: {mode!r}")
@@ -624,6 +851,9 @@ class BookDDPM(nn.Module):
         if batch_size is not None and (
                 not isinstance(batch_size, int) or batch_size < 1):
             raise ValueError("batch_size must be a positive int or None")
+        emb = _checked_context_embedding(
+            self.context_encoder, past_context, past_mask,
+            regime.shape[0], self.n_features, "BookDDPM")
         if generator is None:
             if run_id is not None:
                 seed = derive_seed(run_id, "bookddpm:sample")
@@ -633,7 +863,8 @@ class BookDDPM(nn.Module):
         with torch.inference_mode():
             for start in range(0, regime.shape[0], step):
                 parts.append(self._sample_rows(
-                    regime[start:start + step], generator))
+                    regime[start:start + step], generator,
+                    None if emb is None else emb[start:start + step]))
         if len(parts) == 1:
             out = parts[0]
         else:
@@ -647,7 +878,7 @@ class BookDDPM(nn.Module):
                                               dtype=out.dtype)
         return out
 
-    def _sample_rows(self, regime, generator):
+    def _sample_rows(self, regime, generator, context_emb=None):
         """One reverse chain for a single chunk of regime rows."""
         b = regime.shape[0]
         dev = regime.device
@@ -657,7 +888,8 @@ class BookDDPM(nn.Module):
         acp = self.alphas_cumprod.to(dev)
         for i in reversed(range(self.t_steps)):
             t = torch.full((b,), i, dtype=torch.long, device=dev)
-            eps = self.net(x, t, regime)
+            eps = self.net(x, t, regime, context_emb) \
+                if self.use_history else self.net(x, t, regime)
             a = 1.0 - betas[i]
             ac = acp[i]
             x = (x - betas[i] / torch.sqrt(1 - ac) * eps) / torch.sqrt(a)
@@ -676,7 +908,9 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
                seed: int = 0, verbose: bool = True,
                ema_decay: float | None = None,
                run_id: str | None = None,
-               aux_weights: dict | None = None) -> tuple[list[float], EMA | None]:
+               aux_weights: dict | None = None,
+               past_context: torch.Tensor | None = None,
+               past_mask: torch.Tensor | None = None) -> tuple[list[float], EMA | None]:
     """Train on an isolated stream, as :func:`train_vae` does (stream
     "train_ddpm" for a run ID). Batch order and the per-step noise draws
     in :meth:`BookDDPM.p_loss` come from the scoped stream, and the
@@ -685,7 +919,16 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
     ``aux_weights`` (P06) is passed through to p_loss: None keeps the
     plain denoising objective; a weights dict adds the training-only
     statistical-structure penalties from flowforge.losses. The loss
-    history records the total loss actually optimized."""
+    history records the total loss actually optimized.
+
+    ``past_context``/``past_mask`` (P03) are passed per batch to a
+    history-conditioned model; passing them for a plain model is an
+    error rather than a silent no-op."""
+    if past_context is not None and not getattr(model, "use_history",
+                                                False):
+        raise ValueError(
+            "past_context was passed but the model was built without "
+            "history conditioning (use_history=False)")
     eff_seed = derive_seed(run_id, "train_ddpm") if run_id is not None else seed
     with scoped_rng(eff_seed):
         opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -698,11 +941,14 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
             tot, nb = 0.0, 0
             for i in range(0, n, batch):
                 idx = perm[i:i + batch]
-                if aux_weights is None:
-                    loss = model.p_loss(xc[idx], regime[idx])
-                else:
-                    loss = model.p_loss(xc[idx], regime[idx],
-                                        aux_weights=aux_weights)
+                kw = {}
+                if aux_weights is not None:
+                    kw["aux_weights"] = aux_weights
+                if past_context is not None:
+                    kw["past_context"] = past_context[idx]
+                    if past_mask is not None:
+                        kw["past_mask"] = past_mask[idx]
+                loss = model.p_loss(xc[idx], regime[idx], **kw)
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -721,12 +967,16 @@ def sample_with_ema(model: BookDDPM, ema: EMA, regime: torch.Tensor,
                     seed: int = 0,
                     generator: torch.Generator | None = None,
                     run_id: str | None = None,
-                    batch_size: int | None = None) -> torch.Tensor:
+                    batch_size: int | None = None,
+                    past_context: torch.Tensor | None = None,
+                    past_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Sample from EMA weights, then restore the training weights."""
     ema.apply_to(model)
     try:
         return model.sample(regime, seed=seed, generator=generator,
-                            run_id=run_id, batch_size=batch_size)
+                            run_id=run_id, batch_size=batch_size,
+                            past_context=past_context,
+                            past_mask=past_mask)
     finally:
         ema.restore(model)
 
