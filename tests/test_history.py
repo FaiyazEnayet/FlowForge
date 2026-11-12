@@ -1,9 +1,10 @@
 """Stage 3 P03 tests: causal history conditioning.
 
 Fixture-first: these tests define the P03 contract before the
-implementation. All tests in this file are prefixed
-test_stage3_flowforge_03_ (the shared unit prefix, as in the P02
-tests in tests/test_factorized.py).
+implementation. P03 tests use the ``test_stage3_flowforge_03_`` prefix,
+matching the P02 tests in ``tests/test_factorized.py``. Repository
+discovery found no dedicated rollout test module on main, so the P09 Part 1
+oracle is recorded here under its required selector.
 
 The contract under test:
 
@@ -412,3 +413,39 @@ def test_stage3_flowforge_03_ablation_smoke():
         for k in ("mean_w1", "flow_acf_mae", "discriminator_auc",
                   "cond_w1_mean", "cond_mmd_mean", "nn_ratio"):
             assert np.isfinite(out["arms"][arm][k]), (arm, k)
+
+
+def test_stage3_flowforge_09_part_1_context_advancement_matches_oracle():
+    """A rollout step may use its anchor history and generated output only."""
+    from flowforge.rollout import advance_context
+
+    history = np.arange(2 * 4 * 3, dtype=np.float64).reshape(2, 4, 3)
+    generated = (100 + np.arange(2 * 3 * 3, dtype=np.float64)).reshape(2, 3, 3)
+
+    # Independent known-answer oracle for the last four rows of each
+    # synthetic trajectory. These fixture values are not real-data results.
+    expected = np.array([
+        [[9, 10, 11], [100, 101, 102], [103, 104, 105], [106, 107, 108]],
+        [[21, 22, 23], [109, 110, 111], [112, 113, 114], [115, 116, 117]],
+    ], dtype=np.float64)
+
+    history_before = history.copy()
+    generated_before = generated.copy()
+    actual = advance_context(history, generated, lookback=4)
+
+    np.testing.assert_array_equal(actual, expected)
+    assert not np.shares_memory(actual, history)
+    assert not np.shares_memory(actual, generated)
+    np.testing.assert_array_equal(history, history_before)
+    np.testing.assert_array_equal(generated, generated_before)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        advance_context(history, generated, lookback=True)
+    with pytest.raises(ValueError, match="batch/features"):
+        advance_context(history, generated[:1], lookback=4)
+    non_finite = generated.copy()
+    non_finite[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        advance_context(history, non_finite, lookback=4)
+    with pytest.raises(ValueError, match="real numeric"):
+        advance_context(history, generated.astype(str), lookback=4)
