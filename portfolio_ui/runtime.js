@@ -60,7 +60,23 @@ function flow(){
  slider.oninput=()=>setCursor(+slider.value);ready.push(render());
  const evalStrip=panel('The measuring stick','Generation quality is evaluated on held-out windows, separately from the samples above.','full evaluation-strip','evaluation');g.append(evalStrip);const strip=el('div','evaluation-values');evalStrip.append(strip);[[m.models.ddpm.auc_test.toFixed(3),'DDPM discriminator AUC'],[m.models.vae.auc_test.toFixed(3),'VAE discriminator AUC'],[String(m.n_test),'held-out test windows'],[m.n_train+' / '+m.n_val,'train / validation windows']].forEach(([v,l])=>{const x=el('div');x.append(el('strong','',v),el('span','',l));strip.append(x)});
  figure(g,F[1],'Where the discriminator separates the sources','AUC 0.5 means indistinguishable; above 0.5 exposes detectable differences. Validation-trained classifier, scored on test windows.','wide','discriminator');
- const marg=m.marginals;figure(g,{data:[{x:marg.map(r=>r.w1),y:marg.map(r=>r.feature),type:'bar',orientation:'h',marker:{color:T.accent},hovertemplate:'%{y}<br>W1 %{x:.4f}<extra></extra>'}],layout:{margin:{l:145},xaxis:{title:{text:'Wasserstein-1 distance'}},yaxis:{autorange:'reversed',type:'category'},showlegend:false}},'Fidelity by feature','Per-feature DDPM test-split W1. These features are standardized; the raw units are not interchangeable.','narrow');
+ const featureNames={log_ret:'Log return',log_spread_bps:'Log spread',log_bid_sz:'Log bid size',
+   log_ask_sz:'Log ask size',imbalance:'Book imbalance',signed_flow:'Signed flow',log_trade_count:'Log trade count'};
+ const marg=[...m.marginals].sort((a,b)=>b.w1-a.w1);
+ figure(g,{data:[{x:marg.map(r=>r.w1),y:marg.map(r=>featureNames[r.feature]),type:'bar',orientation:'h',marker:{color:T.accent},hovertemplate:'%{y}<br>W1 %{x:.4f}<extra></extra>'}],layout:{margin:{l:145},xaxis:{title:{text:'Wasserstein-1 distance'}},yaxis:{autorange:'reversed',type:'category'},showlegend:false}},'Fidelity by feature','Per-feature DDPM test-split W1. These features are standardized; the raw units are not interchangeable.','narrow');
+ const models=['DDPM','VAE'];
+ const comparison=[
+   {title:'Marginal fidelity',key:'mean_w1',axis:'Mean Wasserstein-1 distance',caption:'Lower means closer feature distributions.'},
+   {title:'Discriminator separation',key:'auc_test',axis:'Held-out ROC AUC',caption:'An AUC of 0.5 indicates chance-level separation.'}
+ ];
+ for(const {title,key,axis,caption} of comparison){
+   const x=models.map(model=>m.models[model.toLowerCase()][key]);
+   const layout={xaxis:{title:{text:axis},range:[0,key==='auc_test'?1:Math.max(...x)*1.15]},
+     yaxis:{autorange:'reversed'},showlegend:false};
+   if(key==='auc_test')layout.shapes=[{type:'line',x0:.5,x1:.5,y0:0,y1:1,yref:'paper',line:{color:T.muted,dash:'dot',width:1}}];
+   figure(g,{data:[{x,y:models,type:'bar',orientation:'h',marker:{color:[T.colors[0],T.colors[1]]},
+     hovertemplate:'%{y}: %{x:.4f}<extra></extra>'}],layout},title,caption);
+ }
  const acf=m.flow_acf;figure(g,{data:[{x:acf.map(r=>r.lag),y:acf.map(r=>r.real_acf),name:'Observed',type:'scatter',mode:'lines+markers'},{x:acf.map(r=>r.lag),y:acf.map(r=>r.gen_acf),name:'Generated',type:'scatter',mode:'lines+markers'}],layout:{xaxis:{title:{text:'Lag · seconds'}},yaxis:{title:{text:'Signed-flow autocorrelation'}}}},'Does temporal structure survive generation?','Per-window mean autocorrelation, averaged over the evaluation set. Near-zero observed flow is an empirical result, not missing data.','full');
  const detail=panel('The evaluation register','Exact source summaries, retained for inspection.','full');g.append(detail);traceTable(F[2].data[0],detail);traceTable(F[3].data[0],detail);
 }
