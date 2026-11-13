@@ -1,0 +1,168 @@
+{
+ "protocol": "P07 strata ablation (see script docstring)",
+ "dataset": {
+  "path": "/home/hatch/workspace/goals/github-portfolio-credibility-repair/hidden_files/p07-gate/book_windows_expanded.npz",
+  "manifest_sha256": "b7c40026cca52f826a4f0cb5f7025faab907627a8c9cbd74fb861e1446ae581e",
+  "n_chunks": 28,
+  "n_seconds": 302340,
+  "windows": {
+   "train": 18468,
+   "val": 5712,
+   "test": 5712
+  },
+  "session_split": {
+   "train": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+   ],
+   "val": [
+    20,
+    21,
+    22,
+    23
+   ],
+   "test": [
+    24,
+    25,
+    26,
+    27
+   ]
+  }
+ },
+ "strata": {
+  "feature": "past_vol",
+  "n_bins": 10,
+  "edges": [
+   1.436558804186267e-05,
+   2.207294127187376e-05,
+   2.7191038180905453e-05,
+   3.1951731661395105e-05,
+   3.707752244470544e-05,
+   4.3124003250942974e-05,
+   5.078746445351207e-05,
+   6.228249496703868e-05,
+   8.662945784077595e-05
+  ],
+  "min_independent": 10,
+  "weight_scheme": "inverse-frequency over binary tail partition (top past-vol decile vs rest)",
+  "weight_cap": 10.0,
+  "ess": 6649.119991336365
+ },
+ "train": {
+  "epochs": 12,
+  "batch": 32,
+  "seed": 0,
+  "lr": 0.0002
+ },
+ "eval": {
+  "n_eval": 2000,
+  "eval_seed": 1234,
+  "tail_threshold": 0.0011542861190537643
+ },
+ "arms": {
+  "uniform": {
+   "mean_w1": 0.16888194601324819,
+   "flow_acf_mae": 0.0077600875273655615,
+   "disc_auc_test": 0.82482925,
+   "disc_auc_dist": 0.32482924999999996,
+   "tstr_acc_synth": 0.493,
+   "tstr_acc_real": 0.523,
+   "worst_mean_w1": 0.3527403912582581,
+   "worst_stratum": 9,
+   "average_mean_w1": 0.1771323808794139,
+   "average_coverage": 0.5175,
+   "worst_coverage": 0.4277456647398844,
+   "diversity_ratio": 0.8065784146530098,
+   "tail_w1": 0.0012267577844970036,
+   "tail_rate_ratio": 0.4857142857142857,
+   "params": 221767,
+   "train_seconds": 418.9195852279663,
+   "train_loss_final": 0.17336600404039387
+  },
+  "capped_weights": {
+   "mean_w1": 0.1106182185491662,
+   "flow_acf_mae": 0.00954067231623909,
+   "disc_auc_test": 0.823001875,
+   "disc_auc_dist": 0.323001875,
+   "tstr_acc_synth": 0.485,
+   "tstr_acc_real": 0.523,
+   "worst_mean_w1": 0.269090332868077,
+   "worst_stratum": 9,
+   "average_mean_w1": 0.13263463231414424,
+   "average_coverage": 0.4905,
+   "worst_coverage": 0.37572254335260113,
+   "diversity_ratio": 0.8934542215124046,
+   "tail_w1": 0.0011684083341925449,
+   "tail_rate_ratio": 0.657142857142857,
+   "params": 221767,
+   "train_seconds": 394.5569360256195,
+   "train_loss_final": 0.21251035102717192
+  },
+  "stratified": {
+   "mean_w1": 0.1457034031933799,
+   "flow_acf_mae": 0.020332229249751147,
+   "disc_auc_test": 0.858626875,
+   "disc_auc_dist": 0.358626875,
+   "tstr_acc_synth": 0.523,
+   "tstr_acc_real": 0.523,
+   "worst_mean_w1": 0.340138737648835,
+   "worst_stratum": 9,
+   "average_mean_w1": 0.1599037239196573,
+   "average_coverage": 0.425,
+   "worst_coverage": 0.2543352601156069,
+   "diversity_ratio": 0.9689145791531972,
+   "tail_w1": 0.0012138420633680674,
+   "tail_rate_ratio": 0.47857142857142854,
+   "params": 221767,
+   "train_seconds": 444.0477271080017,
+   "train_loss_final": 0.1680490441078958
+  },
+  "chunk_copy": {
+   "mean_w1": 0.062249935985572144,
+   "flow_acf_mae": 0.004812448557306786,
+   "disc_auc_test": 0.521653875,
+   "disc_auc_dist": 0.021653875000000045,
+   "tstr_acc_synth": 0.5275,
+   "tstr_acc_real": 0.523,
+   "worst_mean_w1": 0.13282541988618704,
+   "worst_stratum": 0,
+   "average_mean_w1": 0.09509784343236277,
+   "average_coverage": 0.427,
+   "worst_coverage": 0.27167630057803466,
+   "diversity_ratio": 1.007092733258641,
+   "tail_w1": 0.0009644864572879097,
+   "tail_rate_ratio": 1.0857142857142856,
+   "params": 0,
+   "train_seconds": 0.0,
+   "train_loss_final": null
+  }
+ },
+ "verdicts": {
+  "capped_weights": "null",
+  "stratified": "null"
+ },
+ "limitations": [
+  "Single training/sampling seed (0); no across-seed spread.",
+  "Evaluation on a fixed 2,000-window stratified subsample of test (and val), not the full splits.",
+  "Stratification is on the past-volatility decile only; spread, activity and depth strata are reported as fitted features, not as training arms.",
+  "Test sessions (Nov 11-12) are more volatile than train: 18.6% of test windows sit above the train top-decile volatility threshold."
+ ]
+}

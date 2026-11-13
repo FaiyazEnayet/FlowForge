@@ -36,6 +36,7 @@ import torch.nn as nn
 
 from .data import FEATURE_NAMES, N_FEATURES, WINDOW
 from .models import set_seed
+from .strata import stratified_report
 
 
 # ------------------------------------------------- book consistency audit
@@ -847,7 +848,9 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
                 real_val: np.ndarray, gen_val: np.ndarray,
                 seed: int = 0,
                 feature_mean: np.ndarray = None,
-                feature_std: np.ndarray = None) -> dict:
+                feature_std: np.ndarray = None,
+                stratum_labels=None,
+                feature_name: str = "past_vol") -> dict:
     rep = {
         "marginals": marginal_table(real_test, gen_test),
         "flow_acf": flow_acf_table(real_test, gen_test),
@@ -855,6 +858,14 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
                                            seed=seed),
         "tstr": tstr_flow_direction(real_val, gen_val, real_test, seed=seed),
     }
+    if stratum_labels is not None:
+        # P07: per-stratum fidelity on the same test windows. The
+        # generated rows align with the real rows (same regimes), so
+        # they inherit the real window's stratum. A scarce stratum
+        # raises NotEnoughDataError here instead of reporting.
+        rep["strata"] = stratified_report(
+            real_test, gen_test, stratum_labels,
+            feature_name=feature_name)
     if feature_mean is not None and feature_std is not None:
         pre = book_consistency_table(gen_test, feature_mean, feature_std)
         fixed = constrain_imbalance(gen_test, feature_mean, feature_std)
@@ -956,3 +967,16 @@ def print_report(rep: dict) -> None:
         print(f"mean W1 {ql['mean_w1_delta']:+.4f} | discriminator AUC "
               f"{ql['discriminator_auc_test_delta']:+.4f} | TSTR acc "
               f"{ql['tstr_acc_synth_delta']:+.4f}")
+    if "strata" in rep:
+        st = rep["strata"]
+        print(f"\n=== per-stratum fidelity ({st['feature']}, test split) ===")
+        for b, s in st["strata"].items():
+            print(f"stratum {b}: n_real={s['n_real']} "
+                  f"(indep {s['n_real_independent']}) mean W1 "
+                  f"{s['mean_w1']:.3f} | coverage {s['coverage']:.3f} | "
+                  f"diversity {s['diversity_ratio']:.3f}")
+        print(f"average mean W1 {st['average_mean_w1']:.3f} | worst "
+              f"(stratum {st['worst_stratum']}) "
+              f"{st['worst_mean_w1']:.3f} | average coverage "
+              f"{st['average_coverage']:.3f} | worst coverage "
+              f"{st['worst_coverage']:.3f}")
