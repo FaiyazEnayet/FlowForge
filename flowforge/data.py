@@ -102,6 +102,14 @@ class SplitWindows:
     # mask (True = observed second). None for datasets without it.
     past_context: np.ndarray | None = None  # (n_windows, LOOKBACK, N_FEATURES)
     past_mask: np.ndarray | None = None     # (n_windows, LOOKBACK) bool
+    # P07 lookback aggregates, always recorded by build_dataset: the
+    # trade activity and book depth of the LOOKBACK seconds strictly
+    # before each window. Raw (unstandardized) values: past_activity
+    # is the total trade count over the lookback, past_depth the mean
+    # of the mean log bid/ask sizes over the lookback. None for
+    # datasets built before P07.
+    past_activity: np.ndarray | None = None  # (n_windows,) float32
+    past_depth: np.ndarray | None = None     # (n_windows,) float32
 
 
 @dataclass
@@ -434,6 +442,10 @@ def build_dataset(chunk_dirs: list[str],
     raw_session: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_ctx: dict[str, list] = {"train": [], "val": [], "test": []}
     raw_ctx_mask: dict[str, list] = {"train": [], "val": [], "test": []}
+    # P07 lookback aggregates, one per window, from the same strictly
+    # past lookback the regime features use.
+    raw_activity: dict[str, list] = {"train": [], "val": [], "test": []}
+    raw_depth: dict[str, list] = {"train": [], "val": [], "test": []}
 
     for ci, b in enumerate(ordered):
         split = chunk_to_split[ci]
@@ -444,6 +456,10 @@ def build_dataset(chunk_dirs: list[str],
             secs = seg.index.to_numpy()
             mid = seg["mid"].to_numpy(dtype=np.float64)
             spread = seg["spread_bps"].to_numpy(dtype=np.float64)
+            trade_count = np.expm1(
+                seg["log_trade_count"].to_numpy(dtype=np.float64))
+            depth = (seg["log_bid_sz"].to_numpy(dtype=np.float64)
+                     + seg["log_ask_sz"].to_numpy(dtype=np.float64)) / 2.0
             for start, end in _windows_in_segment(seg):
                 w_t0, w_t1 = secs[start], secs[end - 1]
                 win = arr[start:end]
@@ -454,6 +470,10 @@ def build_dataset(chunk_dirs: list[str],
                 sp = float(np.mean(spread[start - LOOKBACK:start]))
                 raw[split].append(win)
                 raw_regime[split].append([vol, sp])
+                raw_activity[split].append(
+                    float(trade_count[start - LOOKBACK:start].sum()))
+                raw_depth[split].append(
+                    float(depth[start - LOOKBACK:start].mean()))
                 raw_t[split].append((float(w_t0), float(w_t1)))
                 raw_session[split].append(ci)
                 if with_past_context:
@@ -494,10 +514,14 @@ def build_dataset(chunk_dirs: list[str],
                    / f_std).astype(np.float32)
             mask = np.stack(raw_ctx_mask[name])
             assert np.isfinite(ctx).all()
+        act = np.asarray(raw_activity[name], dtype=np.float32)
+        dep = np.asarray(raw_depth[name], dtype=np.float32)
+        assert np.isfinite(act).all() and np.isfinite(dep).all()
         return SplitWindows(x=x.astype(np.float32), regime=r.astype(np.float32),
                             t_start=tt[:, 0], t_end=tt[:, 1],
                             session_ids=ss, past_context=ctx,
-                            past_mask=mask)
+                            past_mask=mask, past_activity=act,
+                            past_depth=dep)
 
     ds = BookDataset(
         train=pack("train"), val=pack("val"), test=pack("test"),
@@ -844,6 +868,16 @@ def save_dataset(ds: BookDataset, path: str) -> None:
             extra[f"{s}_past_context"] = np.asarray(
                 sw.past_context, dtype=np.float32)
             extra[f"{s}_past_mask"] = np.asarray(sw.past_mask, dtype=bool)
+        if (sw.past_activity is None) != (sw.past_depth is None):
+            raise ValueError(
+                f"{s} split carries past_activity without past_depth "
+                f"or the reverse; refusing to save half-described "
+                f"lookback aggregates")
+        if sw.past_activity is not None:
+            extra[f"{s}_past_activity"] = np.asarray(
+                sw.past_activity, dtype=np.float32)
+            extra[f"{s}_past_depth"] = np.asarray(
+                sw.past_depth, dtype=np.float32)
     if ds.manifest is not None:
         extra["manifest_json"] = np.array(json.dumps(ds.manifest))
     if ds.manifest_sha256 is not None:
@@ -1034,9 +1068,30 @@ def _load_dataset_validated(path: str) -> BookDataset:
             if not np.isfinite(ctx).all():
                 raise ValueError(f"{s}_past_context contains "
                                  f"non-finite values")
+        # P07 lookback aggregates: both or neither, float32, one per
+        # window, finite. Datasets built before P07 carry neither and
+        # load with both None.
+        act = dep = None
+        if f"{s}_past_activity" in z or f"{s}_past_depth" in z:
+            if f"{s}_past_activity" not in z or f"{s}_past_depth" not in z:
+                raise ValueError(
+                    f"{s} split carries past_activity without "
+                    f"past_depth or the reverse: corrupt artifact")
+            act, dep = z[f"{s}_past_activity"], z[f"{s}_past_depth"]
+            for name, arr in (("past_activity", act),
+                              ("past_depth", dep)):
+                if arr.dtype != np.float32 or arr.shape != (n,):
+                    raise ValueError(
+                        f"{s}_{name} dtype/shape {arr.dtype}/"
+                        f"{arr.shape} != float32/(n,): archive does "
+                        f"not match the typed dataset format")
+                if not np.isfinite(arr).all():
+                    raise ValueError(f"{s}_{name} contains "
+                                     f"non-finite values")
         return SplitWindows(x=x, regime=regime, t_start=t_start,
                             t_end=t_end, session_ids=session_ids,
-                            past_context=ctx, past_mask=mask)
+                            past_context=ctx, past_mask=mask,
+                            past_activity=act, past_depth=dep)
 
     def _stats(key: str, width: int) -> np.ndarray:
         arr = z[key]
@@ -1058,6 +1113,13 @@ def _load_dataset_validated(path: str) -> BookDataset:
         raise ValueError(
             f"past context present in some splits but not others "
             f"({ctx_presence}): the archive does not describe one "
+            f"consistent dataset")
+    act_presence = {s: splits[s].past_activity is not None
+                    for s in splits}
+    if len(set(act_presence.values())) > 1:
+        raise ValueError(
+            f"past_activity present in some splits but not others "
+            f"({act_presence}): the archive does not describe one "
             f"consistent dataset")
     return BookDataset(
         train=splits["train"], val=splits["val"], test=splits["test"],
@@ -1131,10 +1193,24 @@ def _load_dataset_trusted(path: str) -> BookDataset:
                     f"{s} past context/mask shapes {ctx.shape}/"
                     f"{mask.shape} do not match ({n}, {LOOKBACK}, "
                     f"{N_FEATURES}) windows")
+        act = dep = None
+        if f"{s}_past_activity" in z or f"{s}_past_depth" in z:
+            if f"{s}_past_activity" not in z or f"{s}_past_depth" not in z:
+                raise ValueError(
+                    f"{s} split carries past_activity without "
+                    f"past_depth or the reverse: corrupt artifact")
+            act = np.asarray(z[f"{s}_past_activity"], dtype=np.float32)
+            dep = np.asarray(z[f"{s}_past_depth"], dtype=np.float32)
+            n = z[f"{s}_x"].shape[0]
+            if act.shape != (n,) or dep.shape != (n,):
+                raise ValueError(
+                    f"{s} past_activity/past_depth shapes {act.shape}/"
+                    f"{dep.shape} do not match ({n},) windows")
         return SplitWindows(x=z[f"{s}_x"], regime=z[f"{s}_regime"],
                             t_start=z[f"{s}_t_start"], t_end=z[f"{s}_t_end"],
                             session_ids=ss, past_context=ctx,
-                            past_mask=mask)
+                            past_mask=mask, past_activity=act,
+                            past_depth=dep)
 
     def _meta_list(typed_key: str, object_key: str) -> list:
         if typed_key in z:

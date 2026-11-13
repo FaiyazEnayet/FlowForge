@@ -40,6 +40,7 @@ import torch.nn.functional as F
 
 from .data import FEATURE_NAMES, N_FEATURES, WINDOW
 from .losses import predict_x0, total_auxiliary_loss
+from .strata import stratified_minibatch_indices, validate_training_labels
 
 LATENT_DIM = 16
 REGIME_DIM = 2
@@ -202,12 +203,69 @@ def vae_loss(x, recon, mu, logvar, beta: float = 1e-3):
     return mse + beta * kld, mse, kld
 
 
+def _vae_loss_per_example(x, recon, mu, logvar, beta: float = 1e-3):
+    """Per-example VAE loss, for importance weighting (P07).
+
+    Same terms as :func:`vae_loss`, kept per example: the MSE is the
+    mean over the window's elements and the KLD the sum over latents,
+    so the unweighted mean over examples equals vae_loss exactly up
+    to reduction order.
+    """
+    mse = F.mse_loss(recon, x, reduction="none").mean(dim=(1, 2))
+    kld = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)
+    return mse + beta * kld
+
+
+def _checked_weights(weights, n: int):
+    """Validate P07 importance weights: returns a float32 tensor or None."""
+    if weights is None:
+        return None
+    w = np.asarray(weights, dtype=np.float64)
+    if w.shape != (n,):
+        raise ValueError(
+            f"weights must have length {n}, got shape {w.shape}")
+    if not np.isfinite(w).all() or (w <= 0).any():
+        raise ValueError("weights must be finite and positive")
+    return torch.from_numpy(w.astype(np.float32))
+
+
+def _checked_strata(stratum_labels, n: int):
+    """Validate P07 stratum labels: returns (int array or None, n_bins)."""
+    if stratum_labels is None:
+        return None, 0
+    labels = validate_training_labels(stratum_labels)
+    if labels.shape != (n,):
+        raise ValueError(
+            f"stratum_labels must have length {n}, got shape "
+            f"{labels.shape}")
+    return labels, int(labels.max()) + 1
+
+
+def _epoch_batches(n: int, batch: int, eff_seed: int, epoch: int,
+                   labels_arr, n_bins: int):
+    """Per-epoch batch index lists: uniform permutation by default,
+    round-robin stratified batches when stratum labels are given.
+
+    Both paths yield ceil(n / batch) batches, so a stratified epoch
+    costs exactly as many optimizer steps as a uniform one (equal
+    compute). The stratified seed advances per epoch, deterministically.
+    """
+    if labels_arr is None:
+        perm = torch.randperm(n)
+        return [perm[i:i + batch] for i in range(0, n, batch)]
+    n_batches = (n + batch - 1) // batch
+    return [torch.from_numpy(b) for b in stratified_minibatch_indices(
+        labels_arr, n_bins, batch, n_batches, eff_seed + 1000 * epoch)]
+
+
 def train_vae(model: CondVAE, x: torch.Tensor, regime: torch.Tensor,
               epochs: int = 25, batch: int = 64, lr: float = 1e-3,
               seed: int = 0, verbose: bool = True,
               run_id: str | None = None,
               past_context: torch.Tensor | None = None,
-              past_mask: torch.Tensor | None = None) -> list[float]:
+              past_mask: torch.Tensor | None = None,
+              weights: np.ndarray | None = None,
+              stratum_labels=None) -> list[float]:
     """Train on an isolated stream: batch order and reparameterization
     noise draw from a scoped stream seeded by ``seed`` (or by ``run_id``
     via the "train_vae" stream), and the caller's global RNG state is
@@ -215,26 +273,42 @@ def train_vae(model: CondVAE, x: torch.Tensor, regime: torch.Tensor,
 
     ``past_context``/``past_mask`` (P03) are passed per batch to a
     history-conditioned VAE; passing them for a plain VAE is an error
-    rather than a silent no-op."""
+    rather than a silent no-op.
+
+    ``weights`` (P07) is a per-window importance weight array of
+    length n: the loss of each example is weighted and the batch loss
+    is the weighted mean. ``stratum_labels`` (P07) is a 1-D integer
+    array of regime stratum ids, one per window: batches are then
+    built round-robin across strata (stratified minibatches) instead
+    of from a uniform permutation, at the same step count per epoch.
+    Both are optional and off by default: with neither given, the
+    batching and the loss are exactly the pre-P07 ones. Outcome
+    labels (derived from the window itself) are refused."""
     if past_context is not None and not model.context_dim:
         raise ValueError(
             "past_context was passed but the VAE was built without "
             "history conditioning (context_dim=0)")
     eff_seed = derive_seed(run_id, "train_vae") if run_id is not None else seed
+    n = x.shape[0]
+    w_t = _checked_weights(weights, n)
+    labels_arr, n_bins = _checked_strata(stratum_labels, n)
     with scoped_rng(eff_seed):
         opt = torch.optim.Adam(model.parameters(), lr=lr)
-        n = x.shape[0]
         hist = []
         for ep in range(epochs):
-            perm = torch.randperm(n)
+            index_lists = _epoch_batches(n, batch, eff_seed, ep,
+                                         labels_arr, n_bins)
             tot, nb = 0.0, 0
-            for i in range(0, n, batch):
-                idx = perm[i:i + batch]
+            for idx in index_lists:
                 recon, mu, logvar = model(
                     x[idx], regime[idx],
                     past_context[idx] if past_context is not None else None,
                     past_mask[idx] if past_mask is not None else None)
-                loss, _, _ = vae_loss(x[idx], recon, mu, logvar)
+                if w_t is None:
+                    loss, _, _ = vae_loss(x[idx], recon, mu, logvar)
+                else:
+                    per = _vae_loss_per_example(x[idx], recon, mu, logvar)
+                    loss = (per * w_t[idx]).sum() / w_t[idx].sum()
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -742,7 +816,7 @@ class BookDDPM(nn.Module):
         return s * x0 + s1 * noise
 
     def p_loss(self, x0, regime, aux_weights=None, past_context=None,
-               past_mask=None):
+               past_mask=None, per_example: bool = False):
         """Denoising loss, with optional statistical-structure penalties.
 
         With ``aux_weights=None`` (the default) this is exactly the
@@ -756,8 +830,11 @@ class BookDDPM(nn.Module):
         to enter. The unweighted components of the most recent call
         are recorded on ``self.last_aux_components`` for logging.
 
-        A history-conditioned model (``use_history=True``) also
-        requires the batch's ``past_context``/``past_mask``: the
+        With ``per_example=True`` (P07) the plain denoising MSE is
+        returned per example instead of averaged, so the caller can
+        apply importance weights; it cannot be combined with
+        ``aux_weights``. A history-conditioned model (``use_history=True``)
+        also requires the batch's ``past_context``/``past_mask``: the
         context is encoded causally and its embedding joins the
         conditioning. A plain model rejects a handed context rather
         than silently dropping it.
@@ -771,6 +848,12 @@ class BookDDPM(nn.Module):
         xt = self.q_sample(x0, t, noise)
         pred = self.net(xt, t, regime, emb) if self.use_history \
             else self.net(xt, t, regime)
+        if per_example:
+            if aux_weights is not None:
+                raise ValueError(
+                    "per_example cannot be combined with aux_weights")
+            return F.mse_loss(pred, noise, reduction="none").mean(
+                dim=(1, 2))
         mse = F.mse_loss(pred, noise)
         if aux_weights is None:
             return mse
@@ -910,7 +993,9 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
                run_id: str | None = None,
                aux_weights: dict | None = None,
                past_context: torch.Tensor | None = None,
-               past_mask: torch.Tensor | None = None) -> tuple[list[float], EMA | None]:
+               past_mask: torch.Tensor | None = None,
+               weights: np.ndarray | None = None,
+               stratum_labels=None) -> tuple[list[float], EMA | None]:
     """Train on an isolated stream, as :func:`train_vae` does (stream
     "train_ddpm" for a run ID). Batch order and the per-step noise draws
     in :meth:`BookDDPM.p_loss` come from the scoped stream, and the
@@ -921,6 +1006,16 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
     statistical-structure penalties from flowforge.losses. The loss
     history records the total loss actually optimized.
 
+    ``weights`` (P07) is a per-window importance weight array of
+    length n: the denoising loss of each example is weighted and the
+    batch loss is the weighted mean. ``stratum_labels`` (P07) is a
+    1-D integer array of regime stratum ids, one per window: batches
+    are then built round-robin across strata (stratified minibatches)
+    instead of from a uniform permutation, at the same step count per
+    epoch. Both are optional and off by default: with neither given,
+    the batching and the loss are exactly the pre-P07 ones. Outcome
+    labels (derived from the window itself) are refused.
+
     ``past_context``/``past_mask`` (P03) are passed per batch to a
     history-conditioned model; passing them for a plain model is an
     error rather than a silent no-op."""
@@ -930,17 +1025,19 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
             "past_context was passed but the model was built without "
             "history conditioning (use_history=False)")
     eff_seed = derive_seed(run_id, "train_ddpm") if run_id is not None else seed
+    n = x.shape[0]
+    w_t = _checked_weights(weights, n)
+    labels_arr, n_bins = _checked_strata(stratum_labels, n)
     with scoped_rng(eff_seed):
         opt = torch.optim.Adam(model.parameters(), lr=lr)
         ema = EMA(model, ema_decay) if ema_decay is not None else None
-        n = x.shape[0]
         xc = x.permute(0, 2, 1).contiguous()  # (B, F, L)
         hist = []
         for ep in range(epochs):
-            perm = torch.randperm(n)
+            index_lists = _epoch_batches(n, batch, eff_seed, ep,
+                                         labels_arr, n_bins)
             tot, nb = 0.0, 0
-            for i in range(0, n, batch):
-                idx = perm[i:i + batch]
+            for idx in index_lists:
                 kw = {}
                 if aux_weights is not None:
                     kw["aux_weights"] = aux_weights
@@ -948,7 +1045,12 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
                     kw["past_context"] = past_context[idx]
                     if past_mask is not None:
                         kw["past_mask"] = past_mask[idx]
-                loss = model.p_loss(xc[idx], regime[idx], **kw)
+                if w_t is None:
+                    loss = model.p_loss(xc[idx], regime[idx], **kw)
+                else:
+                    per = model.p_loss(xc[idx], regime[idx],
+                                       per_example=True, **kw)
+                    loss = (per * w_t[idx]).sum() / w_t[idx].sum()
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
