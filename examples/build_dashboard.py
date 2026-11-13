@@ -110,10 +110,10 @@ def _explorer(d):
 
 def _discriminator(d):
     fig = go.Figure()
-    fig.add_trace(go.Histogram(x=d["s_real"], nbinsx=40, opacity=0.6,
+    fig.add_trace(go.Histogram(x=d["s_real"], xbins=dict(start=0, end=1, size=0.05), histnorm="probability", opacity=0.6,
                                name="real test windows",
                                marker_color="steelblue"))
-    fig.add_trace(go.Histogram(x=d["s_gen"], nbinsx=40, opacity=0.6,
+    fig.add_trace(go.Histogram(x=d["s_gen"], xbins=dict(start=0, end=1, size=0.05), histnorm="probability", opacity=0.6,
                                name="generated windows",
                                marker_color="darkorange"))
     fig.update_layout(
@@ -121,7 +121,7 @@ def _discriminator(d):
         title=(f"Discriminator scores on the held-out test split "
                f"(AUC {d['disc_auc']:.3f}; 0.5 = indistinguishable)"),
         xaxis_title="discriminator score (1 = looks generated)",
-        yaxis_title="windows", height=420)
+        yaxis_title="Share of windows", yaxis_tickformat=".0%", height=420)
     return fig
 
 
