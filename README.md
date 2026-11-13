@@ -17,7 +17,7 @@
 FlowForge generates short market-state sequences from recorded BTCUSDT data and tests how closely a model can reproduce observed market behavior. The result is synthetic data evaluated on the behavior it captures, with distributional and temporal checks that go well beyond a plausible price trace.
 
 
-<p align="center"><a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><img src="docs/demo.gif?v=showcase-20261017b" alt="FlowForge demo"></a></p>
+<p align="center"><a href="https://faiyazenayet.github.io/FlowForge/docs/dashboard.html"><img src="docs/demo.gif?v=market-windows-20261113" alt="FlowForge demo"></a></p>
 
 
 Useful synthetic market data preserves local behavior alongside distributional and temporal structure. The sequence explorer connects all three views, so marginal fidelity and market dynamics can be read together in one place. Real and generated windows are independently sampled and compared by their relative time offsets.
@@ -82,7 +82,7 @@ The comparison layer is built for a rigorous headline comparison. Block resampli
 
 The table above brings together two recorded populations: the recorded bundle (demo/metrics.json) reports 937 / 199 / 198 windows from the earlier study, while 996 / 168 / 168 is the current split population. The two studies also used different DDPM capacities (221,767 versus 480,775 parameters), so each set of figures stands as its own study, reported side by side for reference.
 
-![Marginal fidelity against the VAE baseline](docs/results.png)
+![Marginal fidelity against the VAE baseline](docs/results.png?v=market-windows-20261113)
 
 The diffusion result improves on the VAE in mean Wasserstein distance, and the held-out discriminator result shows how far that fidelity carries toward observations. The downstream direction task sits at the majority baseline level, which establishes a clear separation the design makes explicit: distributional fidelity and downstream predictive information measure different things, and FlowForge reports each one directly.
 
