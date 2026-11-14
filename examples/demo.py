@@ -203,7 +203,8 @@ def main():
         os.path.join(ckpt_root, "ddpm"), ddpm, "BookDDPM",
         {"n_features": N_FEATURES, "window": WINDOW, "t_steps": 100,
          "beta_start": 1e-4, "beta_end": 0.08, "ch": cfg["ch"],
-         "n_blocks": cfg["n_blocks"]},
+         "n_blocks": cfg["n_blocks"], "schedule": ddpm.schedule,
+         "objective": ddpm.objective},
         normalizer, split_manifest_sha256=ds.manifest_sha256,
         ema=ddpm_ema, overwrite=True)
     print(f"checkpoints -> {ckpt_root} (vae {vae_manifest['weights_source']}, "
@@ -320,6 +321,8 @@ def main():
         "dataset_legacy": False,
         "ddpm_config": {"ch": cfg["ch"], "n_blocks": cfg["n_blocks"],
                         "epochs": cfg["epochs"], "ema_decay": cfg["ema_decay"],
+                        "schedule": ddpm.schedule,
+                        "objective": ddpm.objective,
                         "params": count_params(ddpm),
                         "source": winner["source"]},
         "sweep_winner": winner,
