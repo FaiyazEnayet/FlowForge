@@ -39,7 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .data import FEATURE_NAMES, N_FEATURES, WINDOW
-from .losses import predict_x0, total_auxiliary_loss
+from .losses import total_auxiliary_loss
 from .strata import stratified_minibatch_indices, validate_training_labels
 
 LATENT_DIM = 16
@@ -730,12 +730,150 @@ def _constrain_imbalance_np(gen: np.ndarray, feature_mean: np.ndarray,
     return fixed
 
 
+def cosine_lr_factor(step: int, total_steps: int) -> float:
+    """Cosine annealing factor: 1 at step 0, 0 at total_steps."""
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    if step <= 0:
+        return 1.0
+    if step >= total_steps:
+        return 0.0
+    return 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
+
+
+def apply_grad_clip(model: nn.Module, max_norm: float) -> float:
+    """Clip the model's gradients to ``max_norm`` (global norm).
+
+    Returns the pre-clip total norm. A non-positive bound raises
+    instead of silently disabling the clip.
+    """
+    if max_norm is None or max_norm <= 0:
+        raise ValueError("clip_grad must be a positive number")
+    return float(torch.nn.utils.clip_grad_norm_(
+        [p for p in model.parameters() if p.grad is not None],
+        max_norm))
+
+
+# ------------------------------------------------- diffusion schedules (P05)
+
+SCHEDULE_KINDS = ("linear", "sqrt", "quadratic", "sigmoid")
+OBJECTIVES = ("epsilon", "v", "x0")
+
+# The cosine schedule is deliberately NOT offered: the project
+# changelog and code notes record that a cosine schedule was tried
+# and diverged. build_schedule refuses it instead of silently
+# shipping a schedule the codebase already knows is unsafe here.
+
+
+def build_schedule(kind: str, t_steps: int, beta_start: float = 1e-4,
+                   beta_end: float = 0.08) -> torch.Tensor:
+    """Validated noise schedule: per-step betas for a DDPM chain.
+
+    Every kind is checked the same way before it is returned: betas
+    finite and in (0, 1), the cumulative noise strictly increasing
+    (log-SNR strictly decreasing), and, for chains of 50 steps or
+    more, the terminal cumulative noise below 0.05 so the reverse
+    chain starts from noise. "linear" is the shipped schedule
+    (linspace beta_start to beta_end); "sqrt" front-loads the noise
+    (beta grows with the square root of progress, same endpoint);
+    "quadratic" grows the beta quadratically: with the shipped 0.08
+    endpoint it leaves terminal cumulative noise at 0.064, above
+    the gate, so a quadratic arm passes beta_end 0.10, which reaches
+    0.031; "sigmoid" is a log-SNR schedule whose log signal-to-noise
+    ratio moves from +6 to -6 along a smoothstep, which fixes its
+    terminal cumulative noise at sigmoid(-6) ~ 0.0025 by
+    construction. A linear schedule ending at 0.02 does not reach
+    the gate at T=100 (terminal cumulative noise 0.36) and is refused
+    by the validation below: the gate is what stops a schedule that
+    would start sampling from 60 percent signal. No kind is a
+    transplanted cosine schedule.
+    """
+    if kind not in SCHEDULE_KINDS:
+        if kind == "cosine":
+            raise ValueError(
+                "cosine schedule is not offered: a cosine schedule "
+                "was tried before and diverged; use one of "
+                f"{SCHEDULE_KINDS}")
+        raise ValueError(f"unknown schedule: {kind!r}")
+    if t_steps < 1:
+        raise ValueError("t_steps must be positive")
+    u = torch.linspace(0.0, 1.0, t_steps, dtype=torch.float64)
+    if kind == "linear":
+        # built in float32 exactly as the shipped code did, so the
+        # default schedule reproduces the previous betas bit-for-bit
+        betas = torch.linspace(beta_start, beta_end, t_steps)
+    elif kind == "sqrt":
+        betas = beta_start + (beta_end - beta_start) * torch.sqrt(u)
+    elif kind == "quadratic":
+        betas = beta_start + (beta_end - beta_start) * u * u
+    else:  # sigmoid log-SNR schedule
+        s = u * u * (3.0 - 2.0 * u)
+        log_snr = 6.0 - 12.0 * s
+        acp = torch.sigmoid(log_snr)
+        prev = torch.cat([torch.ones(1, dtype=torch.float64), acp[:-1]])
+        betas = 1.0 - acp / prev
+    betas = betas.to(torch.float32)
+    b = betas.double()
+    if not bool(torch.isfinite(b).all()) or bool((b <= 0).any()) \
+            or bool((b >= 1).any()):
+        raise ValueError(f"schedule {kind!r} produced invalid betas")
+    acp = torch.cumprod(1.0 - b, dim=0)
+    if bool((torch.diff(acp) >= 0).any()):
+        raise ValueError(
+            f"schedule {kind!r} is not strictly noise-increasing")
+    if t_steps >= 50 and float(acp[-1]) >= 0.05:
+        raise ValueError(
+            f"schedule {kind!r} terminal alpha_bar "
+            f"{float(acp[-1]):.3f} is not below 0.05")
+    return betas
+
+
+def predict_x0_from(pred: torch.Tensor, xt: torch.Tensor,
+                    t: torch.Tensor, sqrt_acp: torch.Tensor,
+                    sqrt_1m_acp: torch.Tensor,
+                    objective: str) -> torch.Tensor:
+    """Recover the clean-window estimate from a network prediction.
+
+    ``objective`` names what the network predicts: "epsilon" (the
+    added noise), "v" (the velocity, sqrt_acp * eps -
+    sqrt_1m_acp * x0), or "x0" (the clean window itself).
+    """
+    s = sqrt_acp[t].view(-1, 1, 1)
+    s1 = sqrt_1m_acp[t].view(-1, 1, 1)
+    if objective == "epsilon":
+        return (xt - s1 * pred) / s
+    if objective == "v":
+        return s * xt - s1 * pred
+    if objective == "x0":
+        return pred
+    raise ValueError(f"unknown objective: {objective!r}")
+
+
+def predict_eps_from(pred: torch.Tensor, xt: torch.Tensor,
+                     t: torch.Tensor, sqrt_acp: torch.Tensor,
+                     sqrt_1m_acp: torch.Tensor,
+                     objective: str) -> torch.Tensor:
+    """Recover the added-noise estimate from a network prediction."""
+    s = sqrt_acp[t].view(-1, 1, 1)
+    s1 = sqrt_1m_acp[t].view(-1, 1, 1)
+    if objective == "epsilon":
+        return pred
+    if objective == "v":
+        x0_hat = s * xt - s1 * pred
+        return (xt - s * x0_hat) / s1
+    if objective == "x0":
+        return (xt - s * pred) / s1
+    raise ValueError(f"unknown objective: {objective!r}")
+
+
 class BookDDPM(nn.Module):
     def __init__(self, n_features: int = N_FEATURES, window: int = WINDOW,
                  t_steps: int = 100, beta_start: float = 1e-4,
                  beta_end: float = 0.08, ch: int = 96, n_blocks: int = 3,
                  seed: int | None = None, run_id: str | None = None,
-                 arch: str = "cnn", use_history: bool = False, **kw):
+                 arch: str = "cnn", use_history: bool = False,
+                 schedule: str = "linear",
+                 objective: str = "epsilon", **kw):
         """Init weights draw from an isolated stream when seeded, exactly
         as :class:`CondVAE` does (stream "bookddpm:init" for a run ID).
         Without a seed or run ID, init uses the global RNG as before.
@@ -752,10 +890,27 @@ class BookDDPM(nn.Module):
         :class:`CausalContextEncoder`. It is wired for the default
         cnn denoiser only, and it is off by default: a plain BookDDPM
         constructs, trains, and samples exactly as before.
+
+        ``schedule`` (P05) selects the noise schedule from
+        :func:`build_schedule`; "linear" is the shipped default and
+        reproduces the previous betas exactly. ``objective`` (P05)
+        selects what the denoiser predicts: "epsilon" (the shipped
+        default), "v" (velocity), or "x0" (the clean window). Both
+        are recorded on the model so checkpoints carry them.
         """
         super().__init__()
         if arch not in DENOISER_ARCHITECTURES:
             raise ValueError(f"unknown denoiser architecture: {arch!r}")
+        if schedule not in SCHEDULE_KINDS:
+            if schedule == "cosine":
+                raise ValueError(
+                    "cosine schedule is not offered: a cosine "
+                    "schedule was tried before and diverged")
+            raise ValueError(f"unknown schedule: {schedule!r}")
+        if objective not in OBJECTIVES:
+            raise ValueError(f"unknown objective: {objective!r}")
+        self.schedule = schedule
+        self.objective = objective
         if use_history and arch != "cnn":
             raise ValueError(
                 "history conditioning is wired for the default cnn "
@@ -787,11 +942,12 @@ class BookDDPM(nn.Module):
             with scoped_rng(seed):
                 self.net, self.context_encoder = _build()
         self.t_steps = t_steps
-        # Linear schedule with beta_end chosen so alpha_bar_T ~ 0.02: the
-        # reverse chain must start from ~pure noise, and per-step betas must
-        # stay small enough that an imperfect denoiser does not blow up the
-        # ancestral sampler. (A cosine schedule was tried and diverged.)
-        betas = torch.linspace(beta_start, beta_end, t_steps)
+        # Validated schedule (P05): build_schedule checks betas,
+        # cumulative-noise monotonicity, and the terminal-noise gate
+        # for every kind, so a new schedule cannot silently break
+        # the reverse chain. Linear is the shipped schedule: a
+        # cosine schedule was tried and diverged, and is refused.
+        betas = build_schedule(schedule, t_steps, beta_start, beta_end)
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)
         self.register_buffer("betas", betas)
@@ -808,6 +964,15 @@ class BookDDPM(nn.Module):
         # Unweighted auxiliary-loss components of the most recent
         # p_loss call that used aux_weights (P06); empty otherwise.
         self.last_aux_components: dict = {}
+
+    @property
+    def terminal_snr(self) -> float:
+        """Signal-to-noise ratio at the last step: alpha_bar_T /
+        (1 - alpha_bar_T). The reverse chain starts from noise only
+        when this is small; the schedule gate keeps it below 0.05 /
+        0.95 ~ 0.053 for chains of 50 steps or more."""
+        last = float(self.alphas_cumprod[-1])
+        return last / (1.0 - last)
 
     def q_sample(self, x0, t, noise):
         # x: (B, F, L)
@@ -848,16 +1013,29 @@ class BookDDPM(nn.Module):
         xt = self.q_sample(x0, t, noise)
         pred = self.net(xt, t, regime, emb) if self.use_history \
             else self.net(xt, t, regime)
+        # The training target depends on the objective (P05): the
+        # added noise for "epsilon", the velocity for "v", the clean
+        # window for "x0". The default "epsilon" target is exactly
+        # the previous loss.
+        if self.objective == "epsilon":
+            target = noise
+        elif self.objective == "v":
+            s = self.sqrt_acp[t].view(-1, 1, 1)
+            s1 = self.sqrt_1m_acp[t].view(-1, 1, 1)
+            target = s * noise - s1 * x0
+        else:  # "x0"
+            target = x0
         if per_example:
             if aux_weights is not None:
                 raise ValueError(
                     "per_example cannot be combined with aux_weights")
-            return F.mse_loss(pred, noise, reduction="none").mean(
+            return F.mse_loss(pred, target, reduction="none").mean(
                 dim=(1, 2))
-        mse = F.mse_loss(pred, noise)
+        mse = F.mse_loss(pred, target)
         if aux_weights is None:
             return mse
-        x0_hat = predict_x0(xt, t, pred, self.sqrt_acp, self.sqrt_1m_acp)
+        x0_hat = predict_x0_from(pred, xt, t, self.sqrt_acp,
+                                 self.sqrt_1m_acp, self.objective)
         aux_total, parts = total_auxiliary_loss(
             x0_hat.permute(0, 2, 1), x0.permute(0, 2, 1),
             weights=aux_weights)
@@ -969,10 +1147,19 @@ class BookDDPM(nn.Module):
                         generator=generator)
         betas = self.betas.to(dev)
         acp = self.alphas_cumprod.to(dev)
+        sacp = self.sqrt_acp.to(dev)
+        s1acp = self.sqrt_1m_acp.to(dev)
         for i in reversed(range(self.t_steps)):
             t = torch.full((b,), i, dtype=torch.long, device=dev)
-            eps = self.net(x, t, regime, context_emb) \
+            pred = self.net(x, t, regime, context_emb) \
                 if self.use_history else self.net(x, t, regime)
+            # The reverse step is written in noise terms for every
+            # objective (P05): a v or x0 prediction is converted to
+            # its implied noise estimate first. For the default
+            # epsilon objective the conversion is the identity, so
+            # fixed-seed outputs are unchanged.
+            eps = predict_eps_from(pred, x, t, sacp, s1acp,
+                                   self.objective)
             a = 1.0 - betas[i]
             ac = acp[i]
             x = (x - betas[i] / torch.sqrt(1 - ac) * eps) / torch.sqrt(a)
@@ -995,7 +1182,11 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
                past_context: torch.Tensor | None = None,
                past_mask: torch.Tensor | None = None,
                weights: np.ndarray | None = None,
-               stratum_labels=None) -> tuple[list[float], EMA | None]:
+               stratum_labels=None,
+               lr_schedule: str = "constant",
+               clip_grad: float | None = None,
+               amp: bool = False,
+               ema_warmup_steps: int = 0) -> tuple[list[float], EMA | None]:
     """Train on an isolated stream, as :func:`train_vae` does (stream
     "train_ddpm" for a run ID). Batch order and the per-step noise draws
     in :meth:`BookDDPM.p_loss` come from the scoped stream, and the
@@ -1018,19 +1209,53 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
 
     ``past_context``/``past_mask`` (P03) are passed per batch to a
     history-conditioned model; passing them for a plain model is an
-    error rather than a silent no-op."""
+    error rather than a silent no-op.
+
+    ``lr_schedule`` (P05) is "constant" (the shipped default) or
+    "cosine", which anneals the learning rate to zero over the
+    run's total optimizer steps. ``clip_grad`` (P05) caps the global
+    gradient norm before each step; None (the default) disables it.
+    Note the Adam interaction, recorded honestly: Adam's update is
+    nearly scale-invariant, so clipping mostly guards pathological
+    batches rather than shrinking ordinary steps. ``amp`` (P05)
+    enables CUDA autocast with a gradient scaler; on a CPU-only run
+    it raises ValueError instead of silently training in reduced
+    precision. ``ema_warmup_steps`` (P05) ramps the EMA decay in;
+    0 (the default) keeps the previous EMA behavior exactly."""
     if past_context is not None and not getattr(model, "use_history",
                                                 False):
         raise ValueError(
             "past_context was passed but the model was built without "
             "history conditioning (use_history=False)")
+    if lr_schedule not in ("constant", "cosine"):
+        raise ValueError(f"unknown lr_schedule: {lr_schedule!r}")
+    if clip_grad is not None and clip_grad <= 0:
+        raise ValueError("clip_grad must be a positive number")
+    use_amp = False
+    scaler = None
+    if amp:
+        params = list(model.parameters())
+        on_cuda = bool(params) and params[0].device.type == "cuda" \
+            and torch.cuda.is_available()
+        if not on_cuda:
+            raise ValueError(
+                "AMP requires a CUDA device; this run is CPU-only")
+        use_amp = True
+        scaler = torch.amp.GradScaler("cuda")
     eff_seed = derive_seed(run_id, "train_ddpm") if run_id is not None else seed
     n = x.shape[0]
     w_t = _checked_weights(weights, n)
     labels_arr, n_bins = _checked_strata(stratum_labels, n)
     with scoped_rng(eff_seed):
         opt = torch.optim.Adam(model.parameters(), lr=lr)
-        ema = EMA(model, ema_decay) if ema_decay is not None else None
+        n_batches = len(_epoch_batches(n, batch, eff_seed, 0,
+                                       labels_arr, n_bins))
+        total_steps = max(epochs * n_batches, 1)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            opt, lambda s: 1.0 if lr_schedule == "constant"
+            else cosine_lr_factor(s, total_steps))
+        ema = EMA(model, ema_decay, warmup_steps=ema_warmup_steps) \
+            if ema_decay is not None else None
         xc = x.permute(0, 2, 1).contiguous()  # (B, F, L)
         hist = []
         for ep in range(epochs):
@@ -1045,15 +1270,31 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
                     kw["past_context"] = past_context[idx]
                     if past_mask is not None:
                         kw["past_mask"] = past_mask[idx]
-                if w_t is None:
-                    loss = model.p_loss(xc[idx], regime[idx], **kw)
-                else:
+
+                def _batch_loss():
+                    if w_t is None:
+                        return model.p_loss(xc[idx], regime[idx], **kw)
                     per = model.p_loss(xc[idx], regime[idx],
                                        per_example=True, **kw)
-                    loss = (per * w_t[idx]).sum() / w_t[idx].sum()
+                    return (per * w_t[idx]).sum() / w_t[idx].sum()
+
                 opt.zero_grad()
-                loss.backward()
-                opt.step()
+                if use_amp:
+                    with torch.amp.autocast("cuda"):
+                        loss = _batch_loss()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
+                    if clip_grad is not None:
+                        apply_grad_clip(model, clip_grad)
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    loss = _batch_loss()
+                    loss.backward()
+                    if clip_grad is not None:
+                        apply_grad_clip(model, clip_grad)
+                    opt.step()
+                scheduler.step()
                 if ema is not None:
                     ema.update(model)
                 tot += loss.item()
@@ -1351,19 +1592,40 @@ def count_params(model: nn.Module) -> int:
 class EMA:
     """Exponential moving average of model weights. Standard DDPM practice:
     sampling from the EMA weights is more stable than from the raw
-    training weights, especially late in training."""
+    training weights, especially late in training.
 
-    def __init__(self, model: nn.Module, decay: float = 0.999):
+    ``warmup_steps`` (P05) ramps the decay in over the first updates:
+    while the step count is inside the warmup, the effective decay is
+    min(decay, (1 + step) / (10 + step)), so the shadow tracks the
+    fast early movement instead of anchoring on the initialization.
+    With warmup_steps 0 (the default) the decay is exactly ``decay``
+    from the first update, as before."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999,
+                 warmup_steps: int = 0):
         self.decay = decay
+        self.warmup_steps = int(warmup_steps)
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be non-negative")
+        self.steps = 0
         self.shadow = {n: p.detach().clone()
                        for n, p in model.named_parameters() if p.requires_grad}
         self._backup = None
 
+    def effective_decay(self, step: int) -> float:
+        """Decay applied at update ``step`` (1-based)."""
+        if self.warmup_steps <= 0 or step > self.warmup_steps:
+            return self.decay
+        return min(self.decay, (1.0 + step) / (10.0 + step))
+
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        self.steps += 1
+        decay = self.effective_decay(self.steps)
         for n, p in model.named_parameters():
             if p.requires_grad:
-                self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+                self.shadow[n].mul_(decay).add_(p.detach(),
+                                                 alpha=1.0 - decay)
 
     @torch.no_grad()
     def apply_to(self, model: nn.Module) -> None:
