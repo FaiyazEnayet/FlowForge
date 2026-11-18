@@ -1,0 +1,449 @@
+{
+ "contract": {
+  "block_lengths": [
+   1,
+   5,
+   10,
+   20
+  ],
+  "challenger_order": [
+   "autoregressive",
+   "conditional_diffusion_forecast",
+   "flow_matching"
+  ],
+  "challenger_order_note": "Smallest fair challenger first: a compact causal probabilistic autoregressor, then a conditional diffusion-forecasting variant, then flow matching only if justified under the same train data, parameter and compute envelopes.",
+  "discriminator": {
+   "architecture": "DiscMLP (128, 64 hidden units)",
+   "epochs": 30,
+   "fit_split": "val",
+   "note": "identical protocol for every method and seed",
+   "score_split": "test",
+   "seed": 0
+  },
+  "generation_seeds": [
+   0,
+   100,
+   200
+  ],
+  "lob_bench_note": "LOB-Bench (ICML 2025) reports strong autoregressive results on a different message-based LOB task; those scores cannot be compared numerically with FlowForge's 1-second feature-window metrics.",
+  "n_boot": 100,
+  "representation": {
+   "conditioning": "regime lookback ending at the window start (past only, never the window itself)",
+   "feature_names": [
+    "log_ret",
+    "log_spread_bps",
+    "log_bid_sz",
+    "log_ask_sz",
+    "imbalance",
+    "signed_flow",
+    "log_trade_count"
+   ],
+   "n_features": 7,
+   "past_context_lookback_seconds": 60,
+   "regime_dims": 2,
+   "standardized_with": "train",
+   "window_seconds": 60
+  },
+  "splits": {
+   "manifest_sha256": "b7c40026cca52f826a4f0cb5f7025faab907627a8c9cbd74fb861e1446ae581e",
+   "n_sessions": 28,
+   "n_test": 5712,
+   "n_train": 18468,
+   "n_val": 5712,
+   "session_disjoint": true,
+   "test_subsample": 1000,
+   "val_subsample": 1000
+  },
+  "train_seed": 0,
+  "tstr": {
+   "epochs": 300,
+   "seed": 0,
+   "task": "second-half signed-flow direction from first-half feature means"
+  },
+  "tuning": {
+   "basis": "equal_optimizer_steps",
+   "equal_parameter_view": true,
+   "note": "every family gets the same optimizer-step budget and the same parameter-count view; the entitlement is recorded per family, not assumed equal after the fact"
+  }
+ },
+ "demo_bundle": {
+  "auc_test": 0.6689878583817978,
+  "build_seed": 7,
+  "corr_error": 0.08833587013301601,
+  "flow_acf": [
+   {
+    "ci_method": "block_bootstrap_block10",
+    "gen_acf": 0.01549884355578311,
+    "gen_ci": [
+     -0.006529443194735593,
+     0.03808473419981609
+    ],
+    "lag": 1,
+    "n_gen": 64,
+    "n_real": 64,
+    "real_acf": -0.00826951030646413,
+    "real_ci": [
+     -0.0254788657195634,
+     0.014483855048195812
+    ]
+   },
+   {
+    "ci_method": "block_bootstrap_block10",
+    "gen_acf": -0.009236885111661063,
+    "gen_ci": [
+     -0.028720895354288005,
+     0.0036253586223305113
+    ],
+    "lag": 2,
+    "n_gen": 64,
+    "n_real": 64,
+    "real_acf": -0.014608635006747642,
+    "real_ci": [
+     -0.026439024908144256,
+     0.00271985007433632
+    ]
+   },
+   {
+    "ci_method": "block_bootstrap_block10",
+    "gen_acf": -0.0201446468300828,
+    "gen_ci": [
+     -0.04789466339865537,
+     0.007634053117346002
+    ],
+    "lag": 3,
+    "n_gen": 64,
+    "n_real": 64,
+    "real_acf": -0.012667508662335385,
+    "real_ci": [
+     -0.022501491867192386,
+     0.006742448956874432
+    ]
+   },
+   {
+    "ci_method": "block_bootstrap_block10",
+    "gen_acf": -0.02093637284174539,
+    "gen_ci": [
+     -0.03584242881700809,
+     -0.010504796184703817
+    ],
+    "lag": 4,
+    "n_gen": 64,
+    "n_real": 64,
+    "real_acf": 0.01036902723290344,
+    "real_ci": [
+     -0.018261903268743322,
+     0.052071596515472454
+    ]
+   },
+   {
+    "ci_method": "block_bootstrap_block10",
+    "gen_acf": -0.028928784462571498,
+    "gen_ci": [
+     -0.05393831877853452,
+     -0.014936051803477016
+    ],
+    "lag": 5,
+    "n_gen": 64,
+    "n_real": 64,
+    "real_acf": -0.004747188896050977,
+    "real_ci": [
+     -0.020753258606582246,
+     0.0032786893385874996
+    ]
+   }
+  ],
+  "joint_error": 0.05337835882313306,
+  "lag_acf_error": 0.01842084751325012,
+  "marginals": [
+   {
+    "feature": "log_ret",
+    "gen_mean": 0.0006798639660701156,
+    "gen_std": 0.7078801989555359,
+    "real_mean": -0.062360730022192,
+    "real_std": 1.102203130722046,
+    "w1": 0.15466106084284842
+   },
+   {
+    "feature": "log_spread_bps",
+    "gen_mean": -0.013413792476058006,
+    "gen_std": 0.023879284039139748,
+    "real_mean": -0.009801508858799934,
+    "real_std": 0.08123378455638885,
+    "w1": 0.017671266828338743
+   },
+   {
+    "feature": "log_bid_sz",
+    "gen_mean": 0.04576360806822777,
+    "gen_std": 0.7953416109085083,
+    "real_mean": -0.20981335639953613,
+    "real_std": 1.7666220664978027,
+    "w1": 0.7130758386907019
+   },
+   {
+    "feature": "log_ask_sz",
+    "gen_mean": 0.08769386261701584,
+    "gen_std": 0.7594553232192993,
+    "real_mean": 0.08954214304685593,
+    "real_std": 1.1452713012695312,
+    "w1": 0.3758200920959742
+   },
+   {
+    "feature": "imbalance",
+    "gen_mean": 0.0072340043261647224,
+    "gen_std": 0.8255783319473267,
+    "real_mean": -0.11792097985744476,
+    "real_std": 1.213131070137024,
+    "w1": 0.40151220169125756
+   },
+   {
+    "feature": "signed_flow",
+    "gen_mean": 0.016938066110014915,
+    "gen_std": 0.3671962320804596,
+    "real_mean": -0.012331357225775719,
+    "real_std": 0.6443150639533997,
+    "w1": 0.059533379864437116
+   },
+   {
+    "feature": "log_trade_count",
+    "gen_mean": 0.00227157911285758,
+    "gen_std": 0.9440212845802307,
+    "real_mean": 0.3576953113079071,
+    "real_std": 1.1314115524291992,
+    "w1": 0.3590569940050347
+   }
+  ],
+  "mean_w1": 0.2973329762883704,
+  "n_windows": 64,
+  "sample_note": "Not measurable from the demo bundle: it carries no sampling timing.",
+  "sample_seconds_per_1k": null,
+  "tail_outside_rate": 0.1591517857142857,
+  "tail_real_outside_rate": 0.016294642857142858,
+  "tail_rows": [
+   {
+    "feature": "log_ret",
+    "high": 2.6319704055786133,
+    "low": -3.9525039196014404,
+    "outside_rate": 0.010416666666666666,
+    "real_outside_rate": 0.019791666666666666
+   },
+   {
+    "feature": "log_spread_bps",
+    "high": -0.010484158992767334,
+    "low": -0.012056190520524979,
+    "outside_rate": 0.9703125,
+    "real_outside_rate": 0.004166666666666667
+   },
+   {
+    "feature": "log_bid_sz",
+    "high": 1.4613752055168163,
+    "low": -6.169247069358826,
+    "outside_rate": 0.00078125,
+    "real_outside_rate": 0.0203125
+   },
+   {
+    "feature": "log_ask_sz",
+    "high": 1.5899253571033478,
+    "low": -3.4049978256225586,
+    "outside_rate": 0.00390625,
+    "real_outside_rate": 0.019791666666666666
+   },
+   {
+    "feature": "imbalance",
+    "high": 1.3941486120224,
+    "low": -2.0411102771759033,
+    "outside_rate": 0.0067708333333333336,
+    "real_outside_rate": 0.019791666666666666
+   },
+   {
+    "feature": "signed_flow",
+    "high": 0.7220163941383362,
+    "low": -1.2135427737236022,
+    "outside_rate": 0.009375,
+    "real_outside_rate": 0.020052083333333335
+   },
+   {
+    "feature": "log_trade_count",
+    "high": 4.018183207511906,
+    "low": -1.0949413776397705,
+    "outside_rate": 0.1125,
+    "real_outside_rate": 0.01015625
+   }
+  ],
+  "tstr_acc_synth": null,
+  "tstr_note": "Not measurable from the demo bundle: it carries no val split to train the TSTR model on."
+ },
+ "demo_full_split": {
+  "auc_test": 0.6689878583817978,
+  "flow_acf": [
+   {
+    "gen_acf": -0.008199099079809806,
+    "lag": 1,
+    "real_acf": -0.009440078099924738
+   },
+   {
+    "gen_acf": -0.0057278908192803495,
+    "lag": 2,
+    "real_acf": 0.01844260958151036
+   },
+   {
+    "gen_acf": 0.00465964659906084,
+    "lag": 3,
+    "real_acf": 0.008625383816438556
+   },
+   {
+    "gen_acf": -0.0031274737639233143,
+    "lag": 4,
+    "real_acf": 0.014070826483812663
+   },
+   {
+    "gen_acf": 0.006317529836165677,
+    "lag": 5,
+    "real_acf": 0.044340939764108925
+   }
+  ],
+  "mean_w1": 0.2763076822930547,
+  "n_test": 198,
+  "note": "Full-split demo numbers from demo/metrics.json; the bundle above is a 64-window subsample of the same evaluation, so its mean W1 differs by subsample noise."
+ },
+ "expanded_corpus": {
+  "ddpm": {
+   "auc_test_mean": 0.709098,
+   "auc_test_seeds": [
+    0.7119455,
+    0.707219,
+    0.7081295
+   ],
+   "hardware": {
+    "cpu_count": 4,
+    "device": "cpu",
+    "platform": "Linux-7.0.0-44-generic-x86_64-with-glibc2.39",
+    "processor": "x86_64",
+    "torch_threads": 2,
+    "torch_version": "2.15.0+cpu"
+   },
+   "minutes": 50.93102387189865,
+   "nfe_per_window": 100,
+   "params": 221767,
+   "peak_memory_mb": null,
+   "peak_memory_note": "FF-R08 recorded a per-run allocation delta (0.006 MB), not peak RSS; the run peak RSS of 545.9 MB covers all seven policies, not the DDPM alone, so no per-policy peak is claimed.",
+   "peak_rss_mb": 545.94921875,
+   "sample_seconds_per_1k_mean": 29.90371300616667,
+   "sample_seconds_per_1k_seeds": [
+    29.962566734499973,
+    29.905159915000013,
+    29.84341236900002
+   ],
+   "test_mean_w1": 0.13764220411102132,
+   "test_mean_w1_seeds": [
+    0.13498079186955647,
+    0.13707566241364968,
+    0.14087015804985784
+   ],
+   "train_loss": 0.18012407893849905,
+   "tstr_acc_synth_mean": 0.5153333333333333,
+   "tstr_acc_synth_seeds": [
+    0.512,
+    0.526,
+    0.508
+   ],
+   "val_corr_error": 0.0660310016791046,
+   "val_joint_error": 0.036234349360438144,
+   "val_lag_acf_error": 0.006437697041771672,
+   "val_mean_w1": 0.1500604222324942,
+   "val_mean_w1_seeds": [
+    0.15090071341770367,
+    0.15021357293420542,
+    0.14906698034557347
+   ]
+  },
+  "disc_epochs": 30,
+  "generation_seeds": [
+   0,
+   100,
+   200
+  ],
+  "n_test": 5712,
+  "n_test_sessions": 4,
+  "n_train": 18468,
+  "n_val": 5712,
+  "run_id": "ff-r08",
+  "test_days": [
+   "2026-11-12"
+  ],
+  "train_seed": 0,
+  "tstr_epochs": 300
+ },
+ "parent_note": "Part 1 of 2: source contract, baseline capture, fixture and independent oracle. No family is implemented and none is labelled superior; the parent stays open until part 2 runs the family comparison.",
+ "parent_status": "open",
+ "pareto_rows": [
+  {
+   "auc_test": 0.709098,
+   "corr_error": 0.0660310016791046,
+   "joint_error": 0.036234349360438144,
+   "lag_acf_error": 0.006437697041771672,
+   "mean_w1": 0.13764220411102132,
+   "method": "ddpm",
+   "nfe_per_window": 100,
+   "params": 221767,
+   "peak_memory_mb": null,
+   "sample_seconds_per_1k": 29.90371300616667,
+   "status": "baseline",
+   "tail_outside_rate": null,
+   "tstr_acc_synth": 0.5153333333333333
+  },
+  {
+   "auc_test": null,
+   "corr_error": null,
+   "joint_error": null,
+   "lag_acf_error": null,
+   "mean_w1": null,
+   "method": "autoregressive",
+   "nfe_per_window": null,
+   "params": null,
+   "peak_memory_mb": null,
+   "sample_seconds_per_1k": null,
+   "status": "pending",
+   "tail_outside_rate": null,
+   "tstr_acc_synth": null
+  },
+  {
+   "auc_test": null,
+   "corr_error": null,
+   "joint_error": null,
+   "lag_acf_error": null,
+   "mean_w1": null,
+   "method": "conditional_diffusion_forecast",
+   "nfe_per_window": null,
+   "params": null,
+   "peak_memory_mb": null,
+   "sample_seconds_per_1k": null,
+   "status": "pending",
+   "tail_outside_rate": null,
+   "tstr_acc_synth": null
+  },
+  {
+   "auc_test": null,
+   "corr_error": null,
+   "joint_error": null,
+   "lag_acf_error": null,
+   "mean_w1": null,
+   "method": "flow_matching",
+   "nfe_per_window": null,
+   "params": null,
+   "peak_memory_mb": null,
+   "sample_seconds_per_1k": null,
+   "status": "pending",
+   "tail_outside_rate": null,
+   "tstr_acc_synth": null
+  }
+ ],
+ "provenance": {
+  "challenge_corpus_note": "The expanded 28-session corpus NPZ is gitignored and not present in this checkout; its numbers below are the FF-R08 record, cited with the manifest SHA, not a recomputation. Part 2 must locate or re-record the corpus before running the comparison.",
+  "committed_manifest_sha256": "eeca9db2c52c0a9d4ba6c05d79db85c226ec04a62e9522357433a26aa7e2c1d4",
+  "demo_metrics_sha256": "3782e9ae84c5e3f988f85472d6ecba12cc19146c1b12e0b6d102d46f563a6449",
+  "demo_npz_sha256": "bdf62c5d1df0dafc8ec1a6e50dc341f4568ff846e9e854a62bd45972943b5599",
+  "ranking_stability_results_sha256": "10ea4dd6e80ed5a3f6484e65989d84b9bba46becd1036e286187d55a7ed93395",
+  "split_manifest_sha256": "b7c40026cca52f826a4f0cb5f7025faab907627a8c9cbd74fb861e1446ae581e"
+ },
+ "schema": "flowforge-family-challenge/1"
+}

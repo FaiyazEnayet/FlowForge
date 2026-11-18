@@ -138,3 +138,79 @@ its own.
 - Limitations: single training seed (0); 1,000-window subsamples,
   not the full splits; test metrics are confirmation only; CPU
   only.
+
+## P10 part 1: Model-family challenge contract and DDPM baseline capture
+
+Question: is the DDPM the best model for seven small tabular
+time-series dimensions, or does a cheaper family match it? Part 1
+captures the contract the comparison must run under and the DDPM
+baseline it must beat; no challenger is implemented here and none is
+labelled superior.
+
+### Frozen contract
+
+- Challenge corpus: expanded 28-session corpus, train 18,468 /
+  val 5,712 / test 5,712 windows, session-disjoint, split-manifest
+  SHA b7c40026cca52f826a4f0cb5f7025faab907627a8c9cbd74fb861e1446ae581e,
+  fixed 1,000-window strided val/test subsamples.
+- Same physical representation (seven features, 60-second windows,
+  train-standardized) and same conditioning information (2-dim
+  regime lookback, past only) for every family.
+- Exactly the same final discriminators: DiscMLP (128, 64), fit on
+  val, scored on test, 30 epochs, protocol seed 0; same TSTR
+  protocol, 300 epochs, protocol seed 0.
+- Equivalent tuning entitlement: same optimizer-step budget and the
+  same parameter-count view, recorded per family.
+- Independent generation seeds: the same seed set (0, 100, 200) for
+  every family so the comparison is paired; draws stay independent
+  across families through per-family sampling streams derived via
+  `derive_seed(run_id, "sampling")`.
+- Metric set, one Pareto table: marginal mean W1, joint error (lag
+  ACF error at lags 1-5 plus cross-feature correlation error, both
+  parts reported), tail coverage (generated values outside the real
+  1st/99th percentile band, next to the real-side reference rate),
+  held-out discriminator AUC, TSTR accuracy, NFE, sampling latency,
+  peak memory, parameter count. Dependence-aware intervals at block
+  lengths 1/5/10/20, as in C03.
+- Challenger order: compact causal probabilistic autoregressor
+  first, conditional diffusion-forecasting variant next, flow
+  matching only if justified under the same train data, parameter
+  and compute envelopes. LOB-Bench scores do not compare: different
+  message-based task, not 1-second feature windows.
+- Full contract: `docs/model-family-challenge-contract.md`;
+  contract as code: `flowforge/family_contract.py`.
+
+### Captured baseline
+
+Harness: `examples/family_baseline.py`, record
+`examples/family_baseline_results.json`. Nothing trained, nothing
+sampled; the script recomputes from committed and already-recorded
+artifacts only.
+
+- Expanded corpus (FF-R08 record): DDPM test mean W1 0.1376, val
+  joint error 0.0362 (lag ACF 0.0064, correlation 0.0660),
+  discriminator AUC 0.7091, TSTR 0.5153, 221,767 parameters, 100
+  NFE per window, 29.90 seconds per 1,000 windows. No per-policy
+  peak memory is claimed: FF-R08 recorded a per-run allocation
+  delta, not peak RSS, and the run peak RSS of 545.9 MB covers all
+  seven policies.
+- Committed demo bundle (64 windows, build seed 7, recomputed
+  here): mean W1 0.2973, discriminator AUC 0.6690 (recomputed from
+  the stored float32 scores to 1.2e-8), joint error 0.0534, tail
+  outside rate 0.1592 against a real-side reference of 0.02. The
+  full-split demo numbers are mean W1 0.2763 and AUC 0.6690 on 198
+  test windows; the bundle is a 64-window subsample, so its mean W1
+  differs by subsample noise. TSTR and latency are null on the
+  bundle (no val split, no timing).
+- The Pareto table carries the DDPM row measured and the three
+  challenger rows pending. No ranking is computed and no family is
+  promoted.
+
+### Open items for part 2
+
+- The expanded-corpus NPZ is gitignored and not present in this
+  checkout; part 2 must locate or re-record it before running the
+  comparison rather than substituting a different corpus.
+- Tail coverage has no FF-R08 value (the study did not measure it),
+  so the DDPM row carries the demo-bundle rate only until part 2
+  measures it on the challenge corpus.

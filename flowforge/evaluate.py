@@ -21,6 +21,17 @@ saw during training (the test split):
    synthetic data is *useful*, a different question from whether it is
    *indistinguishable* (check 3). A generator can pass one and fail the other.
 
+5. Utility tasks (P11): the flow-direction task above is uninformative
+   when the DDPM-trained classifier only equals the majority predictor,
+   so `utility_task_report` scores a preregistered suite of causal
+   prediction tasks (spread widening, trade-activity level, imbalance
+   sign, realized volatility) where features come strictly from the
+   first 30 seconds of a window and labels strictly from the seconds
+   after. Real-to-real, synthetic-to-real, and majority / persistence /
+   class-conditional random baselines are compared on PR-AUC, Brier
+   score, and calibration, with blocked bootstrap intervals. Task
+   definitions live in `flowforge/tasks.py`.
+
 Every metric in this file has a synthetic sanity check in the test suite
 with a known answer (e.g. Wasserstein distance of two identical
 distributions is ~0). If a check fails, the metric is wrong, not the test.
@@ -35,6 +46,7 @@ import torch
 import torch.nn as nn
 
 from .data import FEATURE_NAMES, N_FEATURES, WINDOW
+from .microstructure_metrics import microstructure_report
 from .models import set_seed
 from .strata import stratified_report
 
@@ -850,7 +862,9 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
                 feature_mean: np.ndarray = None,
                 feature_std: np.ndarray = None,
                 stratum_labels=None,
-                feature_name: str = "past_vol") -> dict:
+                feature_name: str = "past_vol",
+                regime_test: np.ndarray = None,
+                regime_gen_test: np.ndarray = None) -> dict:
     rep = {
         "marginals": marginal_table(real_test, gen_test),
         "flow_acf": flow_acf_table(real_test, gen_test),
@@ -867,6 +881,13 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
             real_test, gen_test, stratum_labels,
             feature_name=feature_name)
     if feature_mean is not None and feature_std is not None:
+        # P15: microstructure response diagnostics on the same held-out
+        # windows. The signed-flow rows are labeled trade signed
+        # volume, never OFI; see flowforge/microstructure_metrics.py.
+        rep["microstructure"] = microstructure_report(
+            real_test, gen_test, feature_mean, feature_std,
+            regime_real=regime_test, regime_gen=regime_gen_test,
+            seed=seed)
         pre = book_consistency_table(gen_test, feature_mean, feature_std)
         fixed = constrain_imbalance(gen_test, feature_mean, feature_std)
         fixed_val = constrain_imbalance(gen_val, feature_mean,
@@ -916,6 +937,235 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
     return rep
 
 
+# ------------------------------------------------------- utility tasks (P11)
+
+UTILITY_TASK_SCHEMA = "flowforge-utility-tasks/1"
+
+
+def _utility_paired_diffs(y: np.ndarray, scores: dict,
+                          block_lengths, n_boot: int, seed: int,
+                          comparisons: list[tuple[str, str]]) -> list[dict]:
+    """Blocked bootstrap intervals for paired score differences.
+
+    Every replicate draws ONE chronological block-resample index vector
+    and applies it to the shared test labels and to every score vector,
+    so the pairing is exact. PR-AUC differences are first minus second;
+    Brier differences are second minus first, so a positive value
+    favors the first method under both metrics.
+    """
+    from .tasks import brier_score, pr_auc
+
+    n = len(y)
+    rows = []
+    for block_len in block_lengths:
+        rng = np.random.default_rng(seed + 1000 * int(block_len))
+        draws: dict[tuple[str, str], dict[str, list]] = {
+            c: {"pr_auc": [], "brier": []} for c in comparisons}
+        for _ in range(n_boot):
+            idx = _block_resample_indices(n, block_len, rng)
+            yr = y[idx]
+            for first, second in comparisons:
+                a = scores[first][idx]
+                b = scores[second][idx]
+                draws[(first, second)]["pr_auc"].append(
+                    pr_auc(yr, a) - pr_auc(yr, b))
+                draws[(first, second)]["brier"].append(
+                    brier_score(yr, b) - brier_score(yr, a))
+        for (first, second), vals in sorted(draws.items()):
+            for metric in ("pr_auc", "brier"):
+                arr = np.asarray(vals[metric], dtype=np.float64)
+                if metric == "pr_auc":
+                    point = (pr_auc(y, scores[first])
+                             - pr_auc(y, scores[second]))
+                else:
+                    point = (brier_score(y, scores[second])
+                             - brier_score(y, scores[first]))
+                rows.append({
+                    "block_len": int(block_len),
+                    "comparison": f"{first} - {second}",
+                    "metric": metric,
+                    "diff": float(point),
+                    "ci": [float(np.quantile(arr, 0.025)),
+                           float(np.quantile(arr, 0.975))],
+                    "n_boot": int(len(arr)),
+                })
+    return rows
+
+
+def utility_task_report(train_x: np.ndarray, val_x: np.ndarray,
+                        test_x: np.ndarray, gen_val_by_method: dict,
+                        feature_mean: np.ndarray, feature_std: np.ndarray,
+                        t_start_test: np.ndarray | None = None,
+                        block_lengths=(1, 5, 10, 20), n_boot: int = 200,
+                        seed: int = 0, epochs: int = 300,
+                        manifest_sha256: str | None = None) -> dict:
+    """Preregistered utility-task suite: real vs synthetic vs trivial.
+
+    train_x / val_x / test_x are STANDARDIZED windows; they are
+    inverse-transformed to physical units here, because task labels
+    (spread, trade counts, volatility) are defined in physical units.
+    gen_val_by_method maps a method name (e.g. "ddpm") to its generated
+    VAL windows in the same standardized units.
+
+    Protocol, fixed before the test split is scored (test freeze):
+
+    - Thresholds for the median-split tasks are fit on TRAIN only.
+    - VAL gate: a logistic model fit on real TRAIN windows is scored
+      on real VAL windows next to majority, persistence, and random
+      baselines. A task passes when the real model beats majority on
+      PR-AUC and on Brier. The gate result is recorded for every task,
+      pass or fail; failing tasks stay in the suite as nulls.
+    - TEST: the same protocol as TSTR: models fit on real VAL windows
+      and on each method's generated VAL windows are scored on real
+      TEST windows, next to the same baselines.
+    - Uncertainty is dependence-aware: paired differences use
+      chronological block resamples of the shared test windows.
+
+    No test window is used to choose tasks, thresholds, or models.
+    """
+    from .tasks import (TASK_DESCRIPTIONS, TASK_NAMES, extract_features,
+                        fit_logistic_probs, fit_thresholds,
+                        majority_baseline, persistence_baseline,
+                        random_baseline_scores, score_all, task_labels,
+                        verify_timing)
+
+    phys = {
+        "train": inverse_transform(train_x, feature_mean, feature_std),
+        "val": inverse_transform(val_x, feature_mean, feature_std),
+        "test": inverse_transform(test_x, feature_mean, feature_std),
+    }
+    gen_phys = {m: inverse_transform(g, feature_mean, feature_std)
+                for m, g in gen_val_by_method.items()}
+    thresholds = fit_thresholds(phys["train"])
+    timing = verify_timing(
+        np.arange(len(test_x), dtype=np.float64)
+        if t_start_test is None else t_start_test)
+
+    feats = {s: extract_features(phys[s]) for s in phys}
+    labels = {s: task_labels(phys[s], thresholds) for s in phys}
+    gen_feats = {m: extract_features(g) for m, g in gen_phys.items()}
+    gen_labels = {m: task_labels(g, thresholds)
+                  for m, g in gen_phys.items()}
+    persist = {s: persistence_baseline(phys[s], thresholds) for s in phys}
+
+    tasks: dict = {}
+    for name in TASK_NAMES:
+        val_gate: dict = {}
+        test: dict = {}
+        # VAL gate: fit on train, score on val
+        p_real_val = fit_logistic_probs(feats["train"], labels["train"][name],
+                                        feats["val"], seed=seed,
+                                        epochs=epochs)
+        prev_tr, maj_val = majority_baseline(labels["train"][name],
+                                             len(labels["val"][name]))
+        val_gate["real"] = score_all(labels["val"][name], p_real_val)
+        val_gate["majority"] = score_all(labels["val"][name], maj_val)
+        val_gate["persistence"] = score_all(
+            labels["val"][name], persist["val"][name])
+        val_gate["random"] = score_all(
+            labels["val"][name],
+            random_baseline_scores(len(labels["val"][name]), seed=seed))
+        val_gate["passed"] = bool(
+            val_gate["real"]["pr_auc"] > val_gate["majority"]["pr_auc"]
+            and val_gate["real"]["brier"] < val_gate["majority"]["brier"])
+        # TEST: fit on val (real and each synthetic method), score on test
+        p_real = fit_logistic_probs(feats["val"], labels["val"][name],
+                                    feats["test"], seed=seed, epochs=epochs)
+        test["real"] = score_all(labels["test"][name], p_real)
+        _, maj_test = majority_baseline(labels["val"][name],
+                                        len(labels["test"][name]))
+        test["majority"] = score_all(labels["test"][name], maj_test)
+        test["persistence"] = score_all(
+            labels["test"][name], persist["test"][name])
+        test["random"] = score_all(
+            labels["test"][name],
+            random_baseline_scores(len(labels["test"][name]), seed=seed))
+        test_scores = {
+            "real": p_real,
+            "majority": maj_test,
+            "persistence": persist["test"][name],
+            "random": random_baseline_scores(
+                len(labels["test"][name]), seed=seed),
+        }
+        for method in sorted(gen_val_by_method):
+            p_syn = fit_logistic_probs(
+                gen_feats[method], gen_labels[method][name],
+                feats["test"], seed=seed, epochs=epochs)
+            test[method] = score_all(labels["test"][name], p_syn)
+            test_scores[method] = p_syn
+        comparisons = [("real", "majority")] + [
+            (m, "real") for m in sorted(gen_val_by_method)]
+        tasks[name] = {
+            "description": TASK_DESCRIPTIONS[name],
+            "timing": timing,
+            "val_gate": val_gate,
+            "test": test,
+            "paired_diffs": _utility_paired_diffs(
+                labels["test"][name], test_scores, block_lengths,
+                n_boot, seed, comparisons),
+        }
+
+    return {
+        "schema": UTILITY_TASK_SCHEMA,
+        "schema_version": 1,
+        "tasks": tasks,
+        "thresholds": {k: float(v) for k, v in thresholds.items()},
+        "n_train": int(len(train_x)),
+        "n_val": int(len(val_x)),
+        "n_test": int(len(test_x)),
+        "methods": sorted(gen_val_by_method),
+        "protocol": {
+            "seed": int(seed),
+            "epochs": int(epochs),
+            "block_lengths": [int(b) for b in block_lengths],
+            "n_boot": int(n_boot),
+            "feature_horizon_rows": "0:30",
+            "target_horizon_rows": "30:60 (30s) / 30:40 (10s)",
+            "fit_split_gate": "train",
+            "score_split_gate": "val",
+            "fit_split_test": "val",
+            "score_split_test": "test",
+            "note": ("thresholds fit on train only; tasks and gate "
+                     "fixed before the test split was scored"),
+        },
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def print_utility_report(rep: dict) -> None:
+    print("\n=== utility tasks (real vs synthetic vs trivial, "
+          "PR-AUC / Brier) ===")
+    print(f"n_train={rep['n_train']} n_val={rep['n_val']} "
+          f"n_test={rep['n_test']} | methods: "
+          f"{', '.join(rep['methods'])}")
+    for name, t in rep["tasks"].items():
+        g = t["val_gate"]
+        print(f"\n{name}: {t['description']}")
+        print(f"  VAL gate (fit train, score val): real PR-AUC "
+              f"{g['real']['pr_auc']:.3f} Brier {g['real']['brier']:.3f} | "
+              f"majority PR-AUC {g['majority']['pr_auc']:.3f} Brier "
+              f"{g['majority']['brier']:.3f} | persistence PR-AUC "
+              f"{g['persistence']['pr_auc']:.3f} Brier "
+              f"{g['persistence']['brier']:.3f} | "
+              f"{'PASS' if g['passed'] else 'NULL (no signal on val)'}")
+        s = t["test"]
+        line = (f"  TEST (fit val, score test): real PR-AUC "
+                f"{s['real']['pr_auc']:.3f} Brier {s['real']['brier']:.3f} | "
+                f"majority {s['majority']['pr_auc']:.3f} / "
+                f"{s['majority']['brier']:.3f} | persistence "
+                f"{s['persistence']['pr_auc']:.3f} / "
+                f"{s['persistence']['brier']:.3f}")
+        for m in rep["methods"]:
+            line += (f" | {m} {s[m]['pr_auc']:.3f} / {s[m]['brier']:.3f}")
+        print(line)
+        for row in t["paired_diffs"]:
+            if row["block_len"] != 10:
+                continue
+            print(f"    block 10 {row['comparison']} {row['metric']}: "
+                  f"{row['diff']:+.3f} "
+                  f"[{row['ci'][0]:+.3f}, {row['ci'][1]:+.3f}]")
+
+
 def print_report(rep: dict) -> None:
     print("\n=== marginal distributions (real vs generated, test split) ===")
     print(f"{'feature':<16}{'real_mean':>10}{'gen_mean':>10}"
@@ -946,6 +1196,44 @@ def print_report(rep: dict) -> None:
     print(f"(n_train_synth={t['n_train_synth']}, "
           f"n_train_real={t['n_train_real']}, n_test={t['n_test']}, "
           f"seed fixed)")
+    if "microstructure" in rep:
+        ms = rep["microstructure"]
+        print("\n=== microstructure response (held-out real vs generated,"
+              " shuffled null in brackets) ===")
+        print("signed trade volume vs next returns (corr by lag):")
+        for r in ms["signed_flow_response"]["rows"]:
+            print(f"  lag {r['lag']:>2}: real {r['real']:+.3f} "
+                  f"[{r['real_ci'][0]:+.3f}, {r['real_ci'][1]:+.3f}] | "
+                  f"gen {r['gen']:+.3f} "
+                  f"[{r['gen_ci'][0]:+.3f}, {r['gen_ci'][1]:+.3f}] | "
+                  f"null {r['baseline']:+.3f}")
+        print("book imbalance vs next returns (corr by lag):")
+        for r in ms["imbalance_response"]["rows"]:
+            print(f"  lag {r['lag']:>2}: real {r['real']:+.3f} | "
+                  f"gen {r['gen']:+.3f} | null {r['baseline']:+.3f}")
+        print("return tails (real / gen quantiles):")
+        for r in ms["return_tails"]["rows"]:
+            print(f"  q={r['q']:<6} real {r['real']:+.4f} | "
+                  f"gen {r['gen']:+.4f}")
+        print(f"  tail W1 {ms['return_tails']['tail_w1']:.4f}")
+        print("volatility clustering, |return| ACF (real / gen / null):")
+        for r in ms["volatility_clustering"]["rows"]:
+            print(f"  lag {r['lag']:>2}: {r['real_abs']:+.3f} / "
+                  f"{r['gen_abs']:+.3f} / {r['baseline_abs']:+.3f}")
+        ti = ms["trade_intensity"]
+        print(f"trade intensity: zero-trade seconds real "
+              f"{ti['real']['zero_fraction']:.3f} | gen "
+              f"{ti['gen']['zero_fraction']:.3f} | null "
+              f"{ti['baseline']['zero_fraction']:.3f}; Fano real "
+              f"{ti['real']['fano_factor']:.2f} | gen "
+              f"{ti['gen']['fano_factor']:.2f}")
+        print("spread transitions (up / down / flat):")
+        for name in ("spread_bps", "bid_sz", "ask_sz"):
+            tr = ms["transitions"][name]
+            print(f"  {name}: real {tr['real']['up']:.2f} / "
+                  f"{tr['real']['down']:.2f} / {tr['real']['flat']:.2f} | "
+                  f"gen {tr['gen']['up']:.2f} / {tr['gen']['down']:.2f} / "
+                  f"{tr['gen']['flat']:.2f}")
     if "book_consistency" in rep:
         bc = rep["book_consistency"]
         print("\n=== book consistency audit (raw, before any repair) ===")
