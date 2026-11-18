@@ -1306,6 +1306,51 @@ def train_ddpm(model: BookDDPM, x: torch.Tensor, regime: torch.Tensor,
 
 
 @torch.no_grad()
+def eval_denoising_losses(model: BookDDPM, x: torch.Tensor,
+                          regime: torch.Tensor, seed: int = 0,
+                          batch: int = 32) -> np.ndarray:
+    """Per-window denoising loss on given windows (P12 evaluation).
+
+    The timestep and noise draws come from a scoped stream seeded by
+    ``seed``, so the same call returns bit-identical values and the
+    caller's global RNG state is restored exactly on return. The model
+    is evaluated in eval mode and restored to its previous mode.
+    Per-window values come from ``p_loss(per_example=True)``; the
+    plain objective only (auxiliary weights are a training concern).
+    Empty input raises instead of returning an empty mean.
+    """
+    if x.shape[0] == 0:
+        raise ValueError("eval windows are empty")
+    if regime.shape[0] != x.shape[0]:
+        raise ValueError(
+            f"regime must have length {x.shape[0]}, "
+            f"got {regime.shape[0]}")
+    xc = x.permute(0, 2, 1).contiguous()  # (B, F, L)
+    was_training = model.training
+    model.eval()
+    try:
+        with scoped_rng(seed):
+            parts = []
+            for i in range(0, x.shape[0], batch):
+                per = model.p_loss(xc[i:i + batch], regime[i:i + batch],
+                                   per_example=True)
+                parts.append(per.detach().cpu().numpy())
+    finally:
+        model.train(was_training)
+    return np.concatenate(parts)
+
+
+@torch.no_grad()
+def eval_denoising_loss(model: BookDDPM, x: torch.Tensor,
+                        regime: torch.Tensor, seed: int = 0,
+                        batch: int = 32) -> float:
+    """Mean denoising loss on given windows: the mean of
+    :func:`eval_denoising_losses` under the same scoped draws."""
+    return float(np.mean(eval_denoising_losses(model, x, regime, seed,
+                                               batch)))
+
+
+@torch.no_grad()
 def sample_with_ema(model: BookDDPM, ema: EMA, regime: torch.Tensor,
                     seed: int = 0,
                     generator: torch.Generator | None = None,
