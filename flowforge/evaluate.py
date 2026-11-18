@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 
 from .data import FEATURE_NAMES, N_FEATURES, WINDOW
+from .microstructure_metrics import microstructure_report
 from .models import set_seed
 from .strata import stratified_report
 
@@ -850,7 +851,9 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
                 feature_mean: np.ndarray = None,
                 feature_std: np.ndarray = None,
                 stratum_labels=None,
-                feature_name: str = "past_vol") -> dict:
+                feature_name: str = "past_vol",
+                regime_test: np.ndarray = None,
+                regime_gen_test: np.ndarray = None) -> dict:
     rep = {
         "marginals": marginal_table(real_test, gen_test),
         "flow_acf": flow_acf_table(real_test, gen_test),
@@ -867,6 +870,13 @@ def full_report(real_test: np.ndarray, gen_test: np.ndarray,
             real_test, gen_test, stratum_labels,
             feature_name=feature_name)
     if feature_mean is not None and feature_std is not None:
+        # P15: microstructure response diagnostics on the same held-out
+        # windows. The signed-flow rows are labeled trade signed
+        # volume, never OFI; see flowforge/microstructure_metrics.py.
+        rep["microstructure"] = microstructure_report(
+            real_test, gen_test, feature_mean, feature_std,
+            regime_real=regime_test, regime_gen=regime_gen_test,
+            seed=seed)
         pre = book_consistency_table(gen_test, feature_mean, feature_std)
         fixed = constrain_imbalance(gen_test, feature_mean, feature_std)
         fixed_val = constrain_imbalance(gen_val, feature_mean,
@@ -946,6 +956,44 @@ def print_report(rep: dict) -> None:
     print(f"(n_train_synth={t['n_train_synth']}, "
           f"n_train_real={t['n_train_real']}, n_test={t['n_test']}, "
           f"seed fixed)")
+    if "microstructure" in rep:
+        ms = rep["microstructure"]
+        print("\n=== microstructure response (held-out real vs generated,"
+              " shuffled null in brackets) ===")
+        print("signed trade volume vs next returns (corr by lag):")
+        for r in ms["signed_flow_response"]["rows"]:
+            print(f"  lag {r['lag']:>2}: real {r['real']:+.3f} "
+                  f"[{r['real_ci'][0]:+.3f}, {r['real_ci'][1]:+.3f}] | "
+                  f"gen {r['gen']:+.3f} "
+                  f"[{r['gen_ci'][0]:+.3f}, {r['gen_ci'][1]:+.3f}] | "
+                  f"null {r['baseline']:+.3f}")
+        print("book imbalance vs next returns (corr by lag):")
+        for r in ms["imbalance_response"]["rows"]:
+            print(f"  lag {r['lag']:>2}: real {r['real']:+.3f} | "
+                  f"gen {r['gen']:+.3f} | null {r['baseline']:+.3f}")
+        print("return tails (real / gen quantiles):")
+        for r in ms["return_tails"]["rows"]:
+            print(f"  q={r['q']:<6} real {r['real']:+.4f} | "
+                  f"gen {r['gen']:+.4f}")
+        print(f"  tail W1 {ms['return_tails']['tail_w1']:.4f}")
+        print("volatility clustering, |return| ACF (real / gen / null):")
+        for r in ms["volatility_clustering"]["rows"]:
+            print(f"  lag {r['lag']:>2}: {r['real_abs']:+.3f} / "
+                  f"{r['gen_abs']:+.3f} / {r['baseline_abs']:+.3f}")
+        ti = ms["trade_intensity"]
+        print(f"trade intensity: zero-trade seconds real "
+              f"{ti['real']['zero_fraction']:.3f} | gen "
+              f"{ti['gen']['zero_fraction']:.3f} | null "
+              f"{ti['baseline']['zero_fraction']:.3f}; Fano real "
+              f"{ti['real']['fano_factor']:.2f} | gen "
+              f"{ti['gen']['fano_factor']:.2f}")
+        print("spread transitions (up / down / flat):")
+        for name in ("spread_bps", "bid_sz", "ask_sz"):
+            tr = ms["transitions"][name]
+            print(f"  {name}: real {tr['real']['up']:.2f} / "
+                  f"{tr['real']['down']:.2f} / {tr['real']['flat']:.2f} | "
+                  f"gen {tr['gen']['up']:.2f} / {tr['gen']['down']:.2f} / "
+                  f"{tr['gen']['flat']:.2f}")
     if "book_consistency" in rep:
         bc = rep["book_consistency"]
         print("\n=== book consistency audit (raw, before any repair) ===")
