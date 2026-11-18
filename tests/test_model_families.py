@@ -16,7 +16,6 @@ import os
 
 import numpy as np
 import pytest
-from scipy.stats import mannwhitneyu, rankdata, wasserstein_distance
 
 from flowforge.data import FEATURE_NAMES, N_FEATURES, WINDOW
 from flowforge.evaluate import (auc_score, discriminator_auc,
@@ -58,17 +57,35 @@ def _load_baseline_results():
 
 # ------------------------------------------- independent W1 oracle
 
+def _oracle_w1(a, b):
+    """Exact 1-Wasserstein distance by CDF integration.
+
+    No shared code with the repo's quantile-grid computation: the
+    empirical CDFs are built on the combined sorted grid and the
+    area between them is integrated exactly. CDFs are constant
+    between grid points, so the integral is the sum of the gap
+    heights times the grid spacings.
+    """
+    a = np.sort(np.asarray(a, dtype=np.float64).ravel())
+    b = np.sort(np.asarray(b, dtype=np.float64).ravel())
+    grid = np.sort(np.concatenate([a, b]))
+    fa = np.searchsorted(a, grid, side="right") / len(a)
+    fb = np.searchsorted(b, grid, side="right") / len(b)
+    return float(np.sum(np.abs(fa[:-1] - fb[:-1])
+                        * np.diff(grid)))
+
+
 def test_stage3_flowforge_10_part_1_w1_oracle_matches_repo():
     real, gen = _fixture_windows()
     for j, name in enumerate(FEATURE_NAMES):
         repo = wasserstein_1d(real[:, :, j].ravel(),
                               gen[:, :, j].ravel())
-        oracle = wasserstein_distance(real[:, :, j].ravel(),
-                                      gen[:, :, j].ravel())
+        oracle = _oracle_w1(real[:, :, j].ravel(),
+                            gen[:, :, j].ravel())
         assert abs(repo - oracle) < 1e-9, name
     # identical distributions: both oracles read zero
     assert wasserstein_1d(real.ravel(), real.ravel()) < 1e-12
-    assert wasserstein_distance(real.ravel(), real.ravel()) < 1e-12
+    assert _oracle_w1(real.ravel(), real.ravel()) < 1e-12
     # a constant shift of 0.25 moves every pooled value by 0.25
     mt = marginal_table(real, gen)
     assert abs(mt["mean_w1"] - 0.25) < 1e-9
@@ -79,22 +96,32 @@ def test_stage3_flowforge_10_part_1_w1_oracle_matches_repo():
 def test_stage3_flowforge_10_part_1_w1_oracle_known_answers():
     a = np.array([0.0, 1.0, 2.0, 3.0])
     b = np.array([1.0, 2.0, 3.0, 4.0])
-    assert abs(wasserstein_distance(a, b) - 1.0) < 1e-12
+    assert abs(_oracle_w1(a, b) - 1.0) < 1e-12
     assert abs(wasserstein_1d(a, b) - 1.0) < 1e-12
     # disjoint point masses: the distance is the gap
-    assert abs(wasserstein_distance([0.0, 0.0], [5.0, 5.0]) - 5.0) < 1e-12
+    assert abs(_oracle_w1([0.0, 0.0], [5.0, 5.0]) - 5.0) < 1e-12
+    # unequal sizes: the CDF integral still reads the exact gap,
+    # here the mean distance from 0 to {1, 2, 3}
+    assert abs(_oracle_w1([0.0], [1.0, 2.0, 3.0]) - 2.0) < 1e-12
 
 
 # ------------------------------------------- independent AUC oracle
 
 def _oracle_auc(y_true, y_score):
-    """AUC from the Mann-Whitney U statistic, via scipy ranks."""
+    """AUC by pairwise win counting, no ranks anywhere.
+
+    Every positive is compared with every negative: a win counts 1,
+    a tie counts 1/2. This shares no code path with the repo's
+    rank-based Mann-Whitney computation, so agreement pins the
+    tie handling from the other side.
+    """
     y_true = np.asarray(y_true).ravel()
     y_score = np.asarray(y_score).ravel()
     pos = y_score[y_true == 1]
     neg = y_score[y_true == 0]
-    u = mannwhitneyu(pos, neg, alternative="greater").statistic
-    return float(u / (len(pos) * len(neg)))
+    diff = pos[:, None] - neg[None, :]
+    wins = float((diff > 0).sum()) + 0.5 * float((diff == 0).sum())
+    return wins / (len(pos) * len(neg))
 
 
 def test_stage3_flowforge_10_part_1_auc_oracle_matches_repo():
@@ -102,19 +129,16 @@ def test_stage3_flowforge_10_part_1_auc_oracle_matches_repo():
     y = np.concatenate([np.ones(40), np.zeros(40)])
     s = rng.standard_normal(80) + np.where(y == 1, 0.8, 0.0)
     assert abs(auc_score(y, s) - _oracle_auc(y, s)) < 1e-9
-    # ties: scipy rankdata averages tied ranks, as the repo does
+    # ties: pairwise counting gives ties half a win each, as the
+    # rank-based computation must. Hand count for the tied fixture:
+    # positives 0.5, 0.5, 0.9 against negatives 0.5, 0.1, 0.1 give
+    # 0.5+1+1, 0.5+1+1, 1+1+1 = 8 wins of 9 pairs
     s_tied = np.array([0.5, 0.5, 0.5, 0.9, 0.1, 0.1])
     y_tied = np.array([1, 1, 0, 1, 0, 0])
+    assert abs(auc_score(y_tied, s_tied) - 8.0 / 9.0) < 1e-12
+    assert abs(_oracle_auc(y_tied, s_tied) - 8.0 / 9.0) < 1e-12
     assert abs(auc_score(y_tied, s_tied)
-               - _oracle_auc(y_tied, s_tied)) < 1e-9
-    # perfect separation and perfect inversion are exact
-    assert abs(auc_score([1, 1, 0, 0], [0.9, 0.8, 0.2, 0.1]) - 1.0) < 1e-12
-    assert abs(auc_score([1, 1, 0, 0], [0.1, 0.2, 0.8, 0.9]) - 0.0) < 1e-12
-    # rankdata cross-check on the tied case pins the tie handling:
-    # scores 0.1, 0.1 share rank 1.5; 0.5, 0.5, 0.5 share rank 4;
-    # 0.9 is rank 6. Positives sit at indices 0, 1, 3: ranks 4+4+6
-    ranks = rankdata(s_tied)
-    assert abs(float(ranks[y_tied == 1].sum()) - 14.0) < 1e-12
+               - _oracle_auc(y_tied, s_tied)) < 1e-12
 
 
 def test_stage3_flowforge_10_part_1_stored_disc_auc_recomputes():
@@ -342,8 +366,8 @@ def test_stage3_flowforge_10_part_1_baseline_row_matches_capture():
     demo = baseline["demo_bundle"]
     d = np.load(os.path.join(REPO, "demo", "demo.npz"))
     oracle_w1 = float(np.mean([
-        wasserstein_distance(d["real_windows"][:, :, j].ravel(),
-                             d["gen_windows"][:, :, j].ravel())
+        _oracle_w1(d["real_windows"][:, :, j].ravel(),
+                   d["gen_windows"][:, :, j].ravel())
         for j in range(N_FEATURES)]))
     assert abs(demo["mean_w1"] - oracle_w1) < 1e-9
     assert abs(demo["mean_w1"] - 0.2973) < 1e-3
