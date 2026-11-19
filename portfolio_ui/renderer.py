@@ -52,6 +52,11 @@ def enrich(d,soup,root):
   if t:
    r=next(r for r in t['rows'] if r[0]=='learned');d['metrics']=[[r[1],'learned mean wealth','63d · synthetic experiment'],[r[2],'terminal wealth std','same held-out experiment'],[f'{float(r[3])*100:.1f}%','terminal floor breaches','finite sample, not a guarantee']]
  if repo=='FlowForge':
+  report=jsonfile(root,'examples/ranking_stability_results.json')
+  d['ranking_stability']={key:report[key] for key in [
+   'policies','table','rankings','kendall_tau','pareto','pareto_rule',
+   'preregistration','limitations','split_manifest_sha256']}
+ if repo=='FlowForge':
   m=jsonfile(root,'demo/metrics.json');d['metrics_raw']=m
   d['metrics']=[[f"{m['models']['ddpm']['mean_w1']:.3f}",'DDPM mean W1','lower is better'],[f"{m['models']['vae']['mean_w1']:.3f}",'VAE baseline W1'],[f"{m['models']['ddpm']['auc_test']:.3f}",'DDPM discriminator AUC','0.5 = indistinguishable'],[str(m['n_test']),'held-out test windows']]
  if repo=='grind-bandit':
