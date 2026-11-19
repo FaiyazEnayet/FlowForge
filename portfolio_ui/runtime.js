@@ -33,6 +33,32 @@ function categoryLayout(data,layout,ch){const narrow=ch.clientWidth<650;const t=
 function riskReadout(result,wf){const box=result.panel,left=el('div','risk-plot-column'),lab=el('div','risk-lab-grid'),aside=el('aside','strategy-readout');left.append(result.chart);const legend=box.querySelector('.legend-list');if(legend)left.append(legend);lab.append(left,aside);box.append(lab);box.classList.add('wealth-lab');function update(){const select=box.querySelector('select'),b=wf.layout.updatemenus?.[0]?.buttons[+(select?.value||0)],mask=b?.args?.[0]?.visible||wf.data.map(t=>t.visible!==false);const selected=wf.data.filter((_,i)=>mask[i]);aside.replaceChildren(el('div','eyebrow','SELECTED BOOTSTRAP SCENARIO'),el('h3','',clean(b?.label||'Wealth comparison')));for(const strategy of ['learned','classic']){const median=selected.find(t=>(t.name||'').includes(strategy)&&(t.name||'').includes('median')),band=selected.find(t=>(t.name||'').includes(strategy)&&t.fill==='toself');if(!median)continue;const med=values(median.y).at(-1),v=band?values(band.y):[],half=v.length/2;const row=el('div','strategy-row');row.append(el('h3','',strategy==='learned'?'Learned allocator':'Classical CPPI'),el('strong','',nfmt(med)),el('span','caption','terminal median · wealth index'));if(v.length)row.append(el('p','',nfmt(v[half])+' – '+nfmt(v[half-1])+' terminal P10–P90'));row.append(el('p','caption','Median above floor: '+nfmt(med-90)));aside.append(row)}aside.append(el('p','caption','The terminal percentiles are not breach probabilities. The floor in this explorer stays at 90; published experiment breach rates use a separate sample.'))}update();box.querySelector('select')?.addEventListener('change',update)}
 
 function neural(){metric(D.metrics);const g=grid();const wf=copy(F[1]);wf.layout.shapes=[...(wf.layout.shapes||[]),{type:'line',xref:'paper',x0:0,x1:1,y0:90,y1:90,line:{color:T.accent,width:1.5,dash:'dot'}}];const wealthResult=figure(g,wf,'Wealth against the protection floor','Block-bootstrapped SPY paths · median and 10th–90th percentile bands · wealth starts at 100 · floor 90','full primary','wealth');riskReadout(wealthResult,wf);const policy=copy(F[0]);if(policy.data.length){policy.data.forEach((t,i)=>{t.visible=i===(policy.data.length>1?1:0);t.xaxis='x';t.yaxis='y';delete t.coloraxis;t.name='Floor '+([85,90,95][i]??90)});policy.layout={xaxis:{title:{text:'Fraction of time remaining'}},yaxis:{title:{text:'Cushion · fraction above floor'}},showlegend:false,updatemenus:[{active:policy.data.length>1?1:0,buttons:policy.data.map((t,i)=>({label:t.name,method:'update',args:[{visible:policy.data.map((_,j)=>i===j)},{title:t.name}]}))}]}}figure(g,policy,'The learned allocation policy','Floor selection changes the learned policy surface, not the separate wealth simulation.','wide','policy');if(F[2]&&F[2].data.length&&!F[2].data.every(t=>t.type==='table'))figure(g,F[2],'Capital across four assets','Average policy weights over the evaluated state grid.','narrow');if(F[3]&&F[3].data.length&&!F[3].data.every(t=>t.type==='table'))figure(g,F[3],'How the cushion changes the allocation','Long-only weights for SPY, TLT, GLD and cash at half the horizon.','full');const risk=panel('Return comes with a measured trade-off','Source experiment summaries. Zero observed breaches are finite-sample outcomes.','full','evidence');g.append(risk);const tabs=el('div','tabs');risk.append(tabs);D.tables.forEach((t,i)=>{const b=el('button','',t.title.replace('Single asset (SPY), ','SPY · ').replace('Multi asset (SPY/TLT/GLD + cash), ','Multi · ').replace('Drawdown experiment, 63d, 10k paths: ','Drawdown · ').replace(/,.*$/,''));b.type='button';b.setAttribute('aria-pressed',i===0);const wrap=el('div',i?'hidden':'');wrap.append(el('h3','',t.title));table(t.headers,t.rows,wrap);risk.append(wrap);tabs.append(b);b.onclick=()=>{[...risk.children].filter(n=>n.tagName==='DIV'&&n!==tabs&&!n.classList.contains('panel-head')).forEach(n=>n.classList.add('hidden'));wrap.classList.remove('hidden');tabs.querySelectorAll('button').forEach(n=>n.setAttribute('aria-pressed','false'));b.setAttribute('aria-pressed','true')}});if(D.tables.length){const t=D.tables.find(t=>t.title.includes('Single asset')&&t.title.includes('63d'));if(t){figure(g,{data:[{x:t.rows.map(r=>+r[2]),y:t.rows.map(r=>+r[1]),text:t.rows.map(r=>r[0]),mode:'markers+text',textposition:'top center',marker:{size:12},type:'scatter'}],layout:{xaxis:{title:{text:'Std of terminal wealth'}},yaxis:{title:{text:'Mean terminal wealth'}},showlegend:false}},'Risk and return at 63 days','20,000 held-out synthetic paths · same rows as the single-asset experiment table.','full')}}note('Evidence boundary: the wealth explorer uses resampled historical returns. The experiment summaries use the separate source experiments and their stated samplers. No realized learned-strategy historical path or drawdown distribution is embedded, so neither is fabricated here.')}
+function rankingStability(parent){
+ const r=D.ranking_stability;
+ const p=panel('Ranking stability','A preregistered comparison of validation rankings and held-out outcomes.','full','ranking-stability');
+ parent.append(p);
+ const columns=[['Policy',null],['Val W1','val_mean_w1'],['Val joint error','val_joint_error'],
+  ['Test W1','test_mean_w1'],['Test AUC','auc_test_mean'],['TSTR accuracy','tstr_acc_synth_mean']];
+ const header=columns.map(([name])=>name).concat(['W1 rank','Joint rank','Discriminator rank','TSTR rank']);
+ const rows=r.policies.map(policy=>[
+  policy,...columns.slice(1).map(([,key])=>String(r.table[policy][key])),
+  ...['w1','joint','auc','tstr'].map(key=>String(r.rankings[key][policy]))
+ ]);
+ table(header,rows,p);
+ const trained=r.policies.filter(policy=>policy!=='chunk_copy');
+ const agreements=[['W1 vs joint',r.kendall_tau.w1_vs_joint],
+  ['W1 vs discriminator',r.kendall_tau.w1_vs_auc],['W1 vs TSTR',r.kendall_tau.w1_vs_tstr]];
+ table(['Kendall tau-b · trained policies','Agreement'],agreements.map(([label,value])=>[label,String(value)]),p);
+ note('Agreement is measured across '+trained.length+' trained policies. Pareto set: '+r.pareto.join(', ')+
+  '. DDPM EMA leads the trained policies on validation W1, validation joint error and test discriminator AUC.',p);
+ note('One training seed ('+r.preregistration.train_seed+'); generation seeds '+
+  r.preregistration.gen_seeds.join(', ')+'. The study does not promote a policy to a new default.',p);
+ const provenance=el('details'),summary=el('summary','','Study source and split');
+ provenance.append(summary,el('p','', 'Split-manifest SHA-256: '+r.split_manifest_sha256));
+ const source=el('a','','Read the ranking-stability results');
+ source.href='../examples/ranking_stability_results.json';
+ provenance.append(source);p.append(provenance);
+}
 function flow(){
  const g=grid(),lab=panel('The window comparison lab','Two independent sequences, aligned by offset within a 60-second window. Observed data and model outputs are never interchangeable.','full primary observatory-lab','explorer');g.append(lab);
  const opts=F[0].layout.updatemenus[0].buttons,m=D.metrics_raw;let real=0,gen=8,cursor=0,showObserved=true,showGenerated=true;
@@ -78,6 +104,7 @@ function flow(){
      hovertemplate:'%{y}: %{x:.4f}<extra></extra>'}],layout},title,caption);
  }
  const acf=m.flow_acf;figure(g,{data:[{x:acf.map(r=>r.lag),y:acf.map(r=>r.real_acf),name:'Observed',type:'scatter',mode:'lines+markers'},{x:acf.map(r=>r.lag),y:acf.map(r=>r.gen_acf),name:'Generated',type:'scatter',mode:'lines+markers'}],layout:{xaxis:{title:{text:'Lag · seconds'}},yaxis:{title:{text:'Signed-flow autocorrelation'}}}},'Does temporal structure survive generation?','Per-window mean autocorrelation, averaged over the evaluation set. Near-zero observed flow is an empirical result, not missing data.','full');
+ rankingStability(g);
  const detail=panel('The evaluation register','Exact source summaries, retained for inspection.','full');g.append(detail);traceTable(F[2].data[0],detail);traceTable(F[3].data[0],detail);
 }
 
