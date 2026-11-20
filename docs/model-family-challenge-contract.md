@@ -40,7 +40,11 @@ Every family runs under the same rules, enforced in code by
   volatility and mean spread over the 60 seconds before the window
   start, past only, never the window itself) and, where a family
   uses it, the full 60-second past context with its availability
-  mask. No family sees conditioning another family is denied.
+  mask. One exception is recorded in part 2: the
+  history-conditioned DDPM sees the full 60-second past-context
+  tensor in addition to the regime aggregates, so its row is not
+  conditioning-matched with the other families, which see the
+  regime aggregates only.
 - Exactly the same final discriminators. One held-out discriminator
   protocol for every family and seed: `DiscMLP` (128, 64 hidden
   units), fit on val, scored on test, 30 epochs, protocol seed 0.
@@ -125,9 +129,52 @@ substituting a different corpus. The committed cross-check corpus is
 the 8-chunk dataset in `data/` (manifest SHA
 `eeca9db2c52c0a9d4ba6c05d79db85c226ec04a62e9522357433a26aa7e2c1d4`).
 
+## Part 2 outcome
+
+Part 2 built the challengers fresh rather than reusing the existing
+`ConditionalARBaseline`, which is a linear ridge VAR comparator,
+not a probabilistic neural autoregressor: a compact GRU with a
+Gaussian-mixture next-step head (`flowforge/autoregressive.py`,
+220,476 parameters, 60 sequential steps per window), a
+history-conditioned DDPM (`BookDDPM` with `use_history=True`,
+255,239 parameters, 100 NFE), and rectified flow matching on the
+DDPM denoiser backbone (`flowforge/flow_matching.py`, 221,767
+parameters, 20 Euler steps). The comparison ran in
+`examples/compare_families.py` and is recorded in
+`examples/compare_families_results.json`. Seed means over
+generation seeds 0/100/200 on the 1,000-window strided test
+subsample:
+
+| Method | Test W1 | Val joint | AUC | TSTR | NFE | s / 1k | Params |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| DDPM (retrained) | 0.138 | 0.024 | 0.734 | 0.476 | 100 | 29.8 | 221,767 |
+| Autoregressive | 0.192 | 0.078 | 0.871 | 0.482 | 60 | 1.5 | 220,476 |
+| Conditional diffusion forecast | 0.134 | 0.027 | 0.637 | 0.524 | 100 | 29.8 | 255,239 |
+| Flow matching | 0.126 | 0.025 | 0.702 | 0.470 | 20 | 5.9 | 221,767 |
+| VAE (reference) | 0.407 | 0.228 | 0.980 | 0.505 | 1 | 0.01 | 288,708 |
+| Chunk copy (reference) | 0.052 | 0.016 | 0.508 | 0.533 | 0 | 0.16 | 0 |
+
+The paired block-20 W1 intervals carry the comparison: flow
+matching minus DDPM is +0.012 with an interval of [-0.016, 0.035],
+history-conditioned DDPM minus DDPM is -0.004 with [-0.020,
+0.011], so neither shows a measured W1 difference from the DDPM;
+the autoregressor minus DDPM is +0.054 with [0.041, 0.073], a
+measured higher W1, and chunk copy minus DDPM is -0.086 with
+[-0.121, -0.036]. No TSTR difference survives the block-20
+intervals. The retrained DDPM cross-checks against the recorded
+FF-R08 row (test W1 0.138 against 0.138, AUC 0.734 against 0.709,
+TSTR 0.476 against 0.515). Every trained family overshoots the
+tails (outside rate 0.14 to 0.19 against the real-side reference
+of 0.02); chunk copy sits at 0.026. The run was interrupted once
+by a runtime restart after the DDPM, VAE, and autoregressive
+checkpoints were saved, and resumed from those checkpoints with
+no method retrained.
+
 ## Status
 
-Part 1 of 2: source contract, baseline capture, fixture and
-independent oracle. The parent stays open until part 2 implements
-the families, runs the comparison under this contract, and fills the
-Pareto table.
+Part 2 of 2 complete: the families are implemented, the comparison
+ran under this contract, and the Pareto table is filled. The
+challenge question stays open as a table, not a verdict: the
+cheaper families trade sampling cost against fidelity and
+discrimination on the measures above, and no family is labelled
+superior.

@@ -42,6 +42,19 @@ Top-of-book quotes and signed trade flow become standardized windows. A regime-c
 | Held-out discriminator AUC | DDPM 0.669; VAE 0.937 |
 | Downstream direction task | DDPM-trained accuracy 0.626, equal to the majority baseline; VAE-trained 0.409 |
 
+### Model-family comparison (expanded corpus)
+
+On the expanded 28-session corpus (train 18,468 / val 5,712 / test 5,712 windows, session-disjoint), the DDPM faces three challengers under identical splits, discriminators, tuning entitlement, and generation seeds: a compact causal GRU autoregressor, a history-conditioned DDPM, and rectified flow matching. Seed means on the 1,000-window strided test subsample:
+
+| Method | Test W1 | Val joint | AUC | TSTR | NFE | s / 1k |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| DDPM (retrained) | 0.138 | 0.024 | 0.734 | 0.476 | 100 | 29.8 |
+| Autoregressive | 0.192 | 0.078 | 0.871 | 0.482 | 60 | 1.5 |
+| Conditional diffusion forecast | 0.134 | 0.027 | 0.637 | 0.524 | 100 | 29.8 |
+| Flow matching | 0.126 | 0.025 | 0.702 | 0.470 | 20 | 5.9 |
+
+Flow matching and the history-conditioned DDPM show no measured W1 difference from the DDPM in the paired block-20 intervals, while the autoregressor reads a measurably higher W1 and the regime-matched chunk-copy reference reads lower still at 0.052. No TSTR difference survives the block-20 intervals. The full Pareto table, per-seed numbers, and paired intervals live in `examples/compare_families_results.json`, and the contract in `docs/model-family-challenge-contract.md`.
+
 ## Updating this project
 
 Dashboard source language: **Python**. Generator: `examples/build_dashboard.py`. The local interactive output is `docs/dashboard.html`.
